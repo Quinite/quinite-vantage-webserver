@@ -14,7 +14,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 const server = http.createServer(app);
-const wss = new WebSocketServer({ noServer: true });
+const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
 
 const PORT = parseInt(process.env.PORT) || 10000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -348,26 +348,6 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
             supabase.from('campaigns').select('*, organization:organizations(*)').eq('id', campaignId).single()
         ]);
 
-        // 3. Fire-and-forget Call Log (Don't await here!)
-        // We store the promise to await it ONLY when needed (close/transfer)
-        const logPromise = supabase
-            .from('call_logs')
-            .insert({
-                organization_id: null, // Will be filled contextually if possible, or updated later
-                campaign_id: campaignId,
-                lead_id: leadId,
-                call_sid: callSid,
-                call_status: 'in_progress',
-                direction: 'outbound',
-                caller_number: process.env.PLIVO_PHONE_NUMBER,
-                callee_number: 'PENDING' // Update later
-            })
-            .select() // We need to re-fetch/select correctly after campaign load to get org_id if strict
-        // Actually, we need campaign data for org_id. 
-        // Optimization: Let's delay log creation slightly or do it successfully. 
-        // FASTER: Just fetch DB, then create log in background.
-        // Current code had logPromise *dependent* on synchronous params.
-        // Let's stick to: Fetch DB -> Then Create Log (Background) -> Then WS Ready.
 
         // Wait for DB Data first (needed for Prompt)
         const [leadResult, campaignResult] = await dbFetchPromise;
@@ -1146,8 +1126,15 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
             console.log(`🏁 [${callSid}] ===== CONNECTION CLOSED =====\n`);
         };
 
-        plivoWS.on('close', cleanup);
-        realtimeWS.on('close', cleanup);
+        // Guard against cleanup running twice (both sockets may close near-simultaneously)
+        let cleanedUp = false;
+        const safeCleanup = async () => {
+            if (cleanedUp) return;
+            cleanedUp = true;
+            await cleanup();
+        };
+        plivoWS.on('close', safeCleanup);
+        realtimeWS.on('close', safeCleanup);
 
         return realtimeWS;
 
