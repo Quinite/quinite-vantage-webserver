@@ -1,7 +1,8 @@
 import { createClient } from '@supabase/supabase-js';
 import WebSocket, { WebSocketServer } from 'ws';
 import express from 'express';
-import http from 'http';
+import https from 'https';
+import fs from 'fs';
 import dotenv from 'dotenv';
 import plivo from 'plivo';
 import OpenAI from 'openai';
@@ -13,7 +14,10 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-const server = http.createServer(app);
+const server = https.createServer({
+    key: fs.readFileSync('/etc/letsencrypt/live/server.vantage.quinite.co/privkey.pem'),
+    cert: fs.readFileSync('/etc/letsencrypt/live/server.vantage.quinite.co/fullchain.pem')
+}, app);
 const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
 
 const PORT = parseInt(process.env.PORT) || 10000;
