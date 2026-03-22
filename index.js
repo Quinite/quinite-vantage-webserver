@@ -68,7 +68,7 @@ app.all('/answer', (req, res) => {
     const host = headers.host;
     const protocol = headers['x-forwarded-proto'] === 'https' ? 'wss' : 'wss'; // Default to wss
 
-    const wsUrl = `${protocol}://${host}/voice/stream?leadId=${leadId}&campaignId=${campaignId}&callSid=${callUuid}`;
+    const wsUrl = `${protocol}://${host}:10000/voice/stream?leadId=${leadId}&campaignId=${campaignId}&callSid=${callUuid}`;
 
     // XML requires & to be escaped as &amp;
     const xmlWsUrl = wsUrl.replace(/&/g, '&amp;');
