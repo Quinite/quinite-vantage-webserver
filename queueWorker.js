@@ -84,6 +84,7 @@ async function executeCall(item) {
         }
 
         const fromNumber = getCallerId(campaign);
+        console.log("fromNumber", fromNumber);
         if (!fromNumber) {
             throw new Error("Missing mandatory field: from (PLIVO_PHONE_NUMBER)");
         }
@@ -92,7 +93,7 @@ async function executeCall(item) {
 
         // Step C: Execute Call via Plivo
         const answerUrl = `${WEBSOCKET_SERVER_URL}/answer?leadId=${lead_id}&campaignId=${campaign_id}`;
-        
+
         const response = await plivoClient.calls.create(
             fromNumber,
             lead.phone,
@@ -130,7 +131,7 @@ async function executeCall(item) {
         // Step F: Failure Logging & Retry Strategy
         const currentAttempt = attempt_count + 1;
         const nextRetry = new Date();
-        
+
         // Strategy: Exponential-ish backoff (15m, 30m, 45m)
         nextRetry.setMinutes(nextRetry.getMinutes() + (RETRY_DELAY_MINUTES * currentAttempt));
 
