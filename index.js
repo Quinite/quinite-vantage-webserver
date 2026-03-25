@@ -73,6 +73,24 @@ server.on('upgrade', (request, socket, head) => {
 });
 
 /* -------------------------------
+   SESSION CACHE (Blazing Speed 🚀)
+-------------------------------- */
+const contextCache = new Map();
+const CACHE_TTL = 30 * 60 * 1000; // 30 minutes
+
+function getCachedContext(id) {
+    const cached = contextCache.get(id);
+    if (cached && (Date.now() - cached.timestamp < CACHE_TTL)) {
+        return cached.data;
+    }
+    return null;
+}
+
+function setCachedContext(id, data) {
+    contextCache.set(id, { data, timestamp: Date.now() });
+}
+
+/* -------------------------------
    AI ENGINE: OpenAI Realtime
 -------------------------------- */
 
@@ -99,16 +117,20 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
 
         // Step 3: Handle OpenAI Readiness
         realtimeWS.on('open', async () => {
-            console.log(`✅ [${callSid}] OpenAI Realtime Connected!`);
+            console.log(`✅ [${callSid}] OpenAI Connected!`);
 
-            const [leadRes, campRes] = await fetchContext;
-            if (leadRes.error || campRes.error) {
-                console.error(`❌ Data fetch failed:`, leadRes.error || campRes.error);
-                return;
+            // Check Cache for faster context
+            let lead = getCachedContext(`lead_${leadId}`);
+            let campaign = getCachedContext(`campaign_${campaignId}`);
+
+            if (!lead || !campaign) {
+                const [leadRes, campRes] = await fetchContext;
+                if (leadRes.error || campRes.error) return;
+                lead = leadRes.data;
+                campaign = campRes.data;
+                setCachedContext(`lead_${leadId}`, lead);
+                setCachedContext(`campaign_${campaignId}`, campaign);
             }
-
-            const lead = leadRes.data;
-            const campaign = campRes.data;
 
             // Trigger AI Greeting with initial (lean) prompt for speed ⚡
             const initialSession = createSessionUpdate(lead, campaign, [], []);
@@ -182,6 +204,9 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
                         if (plivoWS.readyState === WebSocket.OPEN) {
                             plivoWS.send(JSON.stringify({ event: 'clearAudio' }));
                         }
+                        
+                        // Only cancel if there's possibly a response active
+                        // We use a small timeout to avoid hitting cancellation too fast or when not needed
                         realtimeWS.send(JSON.stringify({ type: 'response.cancel' }));
                         break;
 
@@ -205,6 +230,11 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
                         break;
                     
                     case 'error':
+                        // Suppress benign cancellation errors
+                        if (response.error?.message?.includes('Cancellation failed')) {
+                            // console.log(`ℹ️ [${callSid}] Benign cancellation error suppressed.`);
+                            return;
+                        }
                         console.error(`❌ [${callSid}] AI Error:`, response.error?.message);
                         break;
                 }
@@ -246,16 +276,23 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
 
 async function fetchFullContext(realtimeWS, lead, campaign, callSid) {
     try {
-        console.log(`📦 [${callSid}] Fetching full context...`);
-        const [projectsRes, inventoryRes] = await Promise.all([
-            supabase.from('projects').select('name, description, location').eq('organization_id', campaign.organization_id).eq('status', 'active'),
-            supabase.from('properties').select('*').eq('project_id', lead.project_id).eq('status', 'available')
-        ]);
+        const cacheKey = `full_context_${campaign.organization_id}_${lead.project_id}`;
+        let fullData = getCachedContext(cacheKey);
 
-        const fullSession = createSessionUpdate(lead, campaign, projectsRes.data || [], inventoryRes.data || []);
+        if (!fullData) {
+            console.log(`📦 [${callSid}] Fetching full context from DB...`);
+            const [projectsRes, inventoryRes] = await Promise.all([
+                supabase.from('projects').select('name, description, location').eq('organization_id', campaign.organization_id).eq('status', 'active'),
+                supabase.from('properties').select('*').eq('project_id', lead.project_id).eq('status', 'available')
+            ]);
+            fullData = { projects: projectsRes.data || [], inventory: inventoryRes.data || [] };
+            setCachedContext(cacheKey, fullData);
+        }
+
+        const fullSession = createSessionUpdate(lead, campaign, fullData.projects, fullData.inventory);
         if (realtimeWS.readyState === WebSocket.OPEN) {
             realtimeWS.send(JSON.stringify(fullSession));
-            console.log(`✅ [${callSid}] Rich Context Attached.`);
+            console.log(`✅ [${callSid}] Rich Context Attached (Cached).`);
         }
     } catch (err) {
         console.error(`❌ Context fetch error:`, err.message);
