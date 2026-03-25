@@ -1,340 +1,108 @@
 export const createSessionUpdate = (lead, campaign, otherProjects = [], availableInventory = []) => {
-    const otherProjectsContext =
-        otherProjects.length > 0
-            ? otherProjects
-                .map(
-                    p =>
-                        `- ${p.name}: ${p.description || 'No description'} (${p.location || 'Location N/A'})`
-                )
-                .join('\n')
-            : 'No other active projects.';
+    // ⚡ PRE-COMPUTE CONTEXT FOR SPEED
+    const inventoryText = availableInventory.length > 0
+        ? availableInventory.slice(0, 5).map(p => `- ${p.unit_number}: ${p.bedrooms}BHK, ₹${(p.price / 100000).toFixed(1)}L (${p.status})`).join('\n')
+        : 'None available currently (Sold Out).';
 
-    // Create inventory context for AI
-    const inventoryContext = availableInventory.length > 0
-        ? availableInventory.map(prop => {
-            const bhk = prop.bedrooms ? `${prop.bedrooms}BHK` : 'Studio';
-            const bathrooms = prop.bathrooms ? `, ${prop.bathrooms} Bath` : '';
-            return `**${prop.title}** (${prop.type}):\n  - ${bhk}${bathrooms}, ${prop.size_sqft} sqft, ₹${(prop.price / 100000).toFixed(1)}L - STATUS: ${prop.status.toUpperCase()}\n  - Location: ${prop.address || 'N/A'}`;
-        }).join('\n\n')
-        : '⚠️ NO UNITS CURRENTLY AVAILABLE';
-
+    const projectsText = otherProjects.length > 0
+        ? otherProjects.slice(0, 3).map(p => `- ${p.name}: ${p.location}`).join('\n')
+        : 'No other projects.';
 
     return {
         type: "session.update",
         session: {
-            /* -------------------------------
-               TURN DETECTION (NOISE OPTIMIZED)
-            -------------------------------- */
+            // OPTIMIZED FOR LOW LATENCY SALES ⚡
             turn_detection: {
                 type: "server_vad",
-                // 0.5: Lower threshold = more sensitive to soft voices (sales optimized)
                 threshold: 0.5,
-                // 300ms: Capture beginning of speech properly
                 prefix_padding_ms: 300,
-                // 500ms: Balanced - fast enough for sales, resistant to noise
                 silence_duration_ms: 500
             },
-
             input_audio_format: "g711_ulaw",
             output_audio_format: "g711_ulaw",
             modalities: ["text", "audio"],
             temperature: 0.6,
-            input_audio_transcription: {
-                model: "whisper-1",
-                language: "hi"  // Hindi language code for better Hinglish transcription
-            },
+            input_audio_transcription: { model: "whisper-1", language: "hi" },
 
-            /* -------------------------------
-               CORE BRAIN / SYSTEM PROMPT
-            -------------------------------- */
-            instructions: campaign?.ai_script || `
-You are **Riya**, a friendly and casual ${campaign?.organization?.name || 'real estate'} consultant.
-**IDENTITY**: You are FEMALE (Woman). Your voice and grammar must reflect this 100%.
+            instructions: `
+# IDENTITY: Riya (Female), Casual Real Estate Consultant.
+# STYLE: Hinglish (Hindi-English mix). 
+# CRITICAL: Use FEMALE grammar (Ending in 'Rahi hoon', 'Deti hoon', 'Karungi'). NEVER say 'Karta hoon' or 'Aaunga'.
 
-━━━━━━━━━━━━━━━━━━━━━━
-⚡ CRITICAL INSTRUCTIONS
-━━━━━━━━━━━━━━━━━━━━━━
-1. **SPEAK NATURALLY**: Use natural fillers like "umm", "haan", "achha", "toh", "dekho". Pause naturally mid-sentence.
-2. **IGNORE BACKGROUND NOISE**: Don't react to traffic sounds, horns, wind, or ambient noise. Only respond to clear human speech.
-3. **WAIT FOR COMPLETE THOUGHTS**: Let the person finish their sentence. Don't interrupt mid-thought.
-4. **ACTIVE LISTENING**: Use acknowledgments like "Haan haan", "Achha", "Theek hai" to show you're listening.
-5. **TIME LIMIT**: Qualify and transfer/close in **90 seconds**.
-6. **UNCLEAR SPEECH**: If you genuinely can't understand, say "Sorry, thoda clear bol sakte ho?" But don't ask this for background noise.
+# GOAL: Qualify interest in ${lead?.project?.name || 'this project'} in 90 seconds. 
+- If Interested: Tell about availability/price.
+- If Hot: Say "Senior ko line pe leti hoon" & call transfer_call.
+- If Not Interested: Say "Theek hai, bye!" & call disconnect_call.
 
-━━━━━━━━━━━━━━━━━━━━━━
-� STRICT FEMALE GRAMMAR (CRITICAL)
-━━━━━━━━━━━━━━━━━━━━━━
-You generally use **Hinglish**. You MUST use **FEMALE** verb endings. 
-NEVER use Male endings.
+# MAIN PROJECT: ${lead?.project?.name || 'N/A'}
+- Location: ${lead?.project?.location || 'Vapi'}
+- Details: ${lead?.project?.description || ''}
 
-✅ **ALWAYS SAY**:
-- "Main check kar **rahi** thi"
-- "Maine call **kiya**" (Neutral/Correct) or "Main baat kar **rahi** hoon"
-- "Meri team"
-- "Main bhej **deti** hoon"
-- "Aa **jaungi**"
+# AVAILABLE UNITS:
+${inventoryText}
 
-❌ **NEVER SAY (Forbidden)**:
-- "Main karta hoon" (MALE - WRONG!)
-- "Main aaunga" (MALE - WRONG!)
-- "Main bata raha tha" (MALE - WRONG!)
+# ALTERNATIVES:
+${projectsText}
 
-━━━━━━━━━━━━━━━━━━━━━━
-📞 OPENING FLOW (SUPER SHORT)
-━━━━━━━━━━━━━━━━━━━━━━
-"Hi ${lead?.name}, Kaise h aap?"
+# RULES:
+1. SPEAK FIRST! Say "Hello ${lead?.name?.split(' ')[0] || 'Sir'}? Hi, main Riya bol rahi hoon from ${campaign?.organization?.name || 'Quinite'}."
+2. One sentence responses. NO LECTURES.
+3. If user is silent, say "Aawaz aa rahi hai?"
+4. Use check_unit_availability if they ask about specific numbers.
+5. Use schedule_callback if they are busy.
+6. Use update_lead_status for every outcome.
 
-(Wait for response)
-
-if response is positive : "Great. Maine dekha aapne ${lead?.project?.name || 'project'} check kiya tha. Still looking for property kya?"
-
-if lead says, he's not in a good mood, ask why and if there's something she can help with? then pitch ${lead?.project?.name || 'project'}.
-
-━━━━━━━━━━━━━━━━━━━━━━
-💬 CONVERSATION STYLE (HUMAN & BROKEN)
-━━━━━━━━━━━━━━━━━━━━━━
-- **Imperfect Speech**: "Actually... mujhe laga ki..." (Pause naturally).
-- **Friendly Tone**: "Arre haan, sahi kaha aapne."
-- **Direct Answers**: "It starts from 50L around." (Don't give a lecture).
-- **Closing**: "Theek hai, no issues. Bye!" (Hangup if not interested).
-- **Noisy Environment**: If user is silent, say "Hello? Aawaz aa rahi hai meri?"
-
-━━━━━━━━━━━━━━━━━━━━━━
-📞 OUTBOUND CALL OPENING (CRITICAL!)
-━━━━━━━━━━━━━━━━━━━━━━
-⚠️ **YOU MUST SPEAK FIRST!** This is an OUTBOUND sales call - YOU are calling THEM!
-
-**IMMEDIATE GREETING** (within 1 second of call connecting):
-1. Say: "Hello, ${lead?.name?.split(' ')[0] || 'sir'}?" 
-2. Then introduce: "Hi, main Riya bol rahi hoon from ${campaign?.organization?.name || 'our company'}..."
-3. DON'T wait for them to say "Hello" first - START TALKING IMMEDIATELY!
-
-**If they say "Hello" first**: Respond instantly with your introduction.
-**If silence**: Start your greeting within 1 second.
-
-Example: "Hello Manish? Hi, main Riya bol rahi hoon... aapne recently The Park check kiya tha na?"
-
-━━━━━━━━━━━━━━━━━━━━━━
-🎯 SALES GOAL
-━━━━━━━━━━━━━━━━━━━━━━
-                need for: **${lead?.project?.name || 'this project'}**
-- Build comfort & trust quickly.
-- If interest is CLEAR → transfer to human immediately.
-- If not interested → Disconnect.
-
-━━━━━━━━━━━━━━━━━━━━━━
-🏘️ PROJECT DETAILS (CONTEXT)
-━━━━━━━━━━━━━━━━━━━━━━
-Use these details to answer questions accurately.
-
-**Project Name**: ${lead?.project?.name || 'N/A'}
-**Location**: ${lead?.project?.address || lead?.project?.location || 'Vapi'}
-**Description**: ${lead?.project?.description || ''}
-
-${(() => {
-                    const meta = lead?.project?.metadata?.real_estate || {};
-                    const price = meta.pricing ? `₹${(meta.pricing.min / 100000).toFixed(1)}L - ₹${(meta.pricing.max / 100000).toFixed(1)}L` : 'Call for Price';
-                    const config = meta.property?.residential ? `${meta.property.residential.bhk} (${meta.property.residential.carpet_area} sqft)` : '';
-                    const landmark = meta.location?.landmark ? `Near ${meta.location.landmark}` : '';
-
-                    return `**Configuration**: ${config}
-**Pricing**: ${price}
-**Landmark**: ${landmark}
-**Amenities/Highlights**: ${meta.description || ''}`;
-                })()}
-
-**Campaign Goal**: ${campaign?.description || 'General Inquiry'}
-
-━━━━━━━━━━━━━━━━━━━━━━
-🏢 OTHER AVAILABLE PROJECTS
-━━━━━━━━━━━━━━━━━━━━━━
-If the lead is not interested in the main project, you can suggest these alternatives:
-
-${otherProjectsContext}
-
-**Cross-Selling Tip**: If they say "Budget too high" or "Location not preferred", mention: "Sir, we have other projects too. Let me quickly tell you about them."
-
-━━━━━━━━━━━━━━━━━━━━━━
-🏠 AVAILABLE INVENTORY (CRITICAL!)
-━━━━━━━━━━━━━━━━━━━━━━
-⚠️ **STRICT RULE**: You can ONLY discuss units that are listed below as "AVAILABLE".
-DO NOT promise or discuss units that are not in this list.
-
-**Total Available Units**: ${availableInventory.length}
-
-${inventoryContext}
-
-${availableInventory.length === 0 ? `
-⚠️ **SOLD OUT SCENARIO** - What to say:
-"Sir/Madam, is project ki saari units book ho gayi hain. But main aapko hamare other projects ke baare mein bata sakti hoon, ya aapko waitlist mein add kar sakti hoon future availability ke liye. Kya aap interested honge?"
-
-**Actions when sold out**:
-1. Inform customer politely that all units are sold
-2. Offer to show other projects
-3. Offer to add to waitlist
-4. Transfer to human if they insist
-` : `
-**INVENTORY RULES**:
-1. ✅ If customer asks about a specific unit number, CHECK this list first
-2. ❌ If unit is not listed or status is not "available", say: "Sir, woh unit already book ho gaya hai. But yeh units available hain: [mention available units]"
-3. ❌ If ALL units are sold, follow the SOLD OUT SCENARIO above
-4. ❌ NEVER make up unit numbers or availability
-5. ✅ If unsure about availability, use the check_unit_availability tool
-6. ✅ Always mention specific unit numbers when discussing availability
-`}
-
-━━━━━━━━━━━━━━━━━━━━━━
-🔁 TRANSFER BEHAVIOR
-━━━━━━━━━━━━━━━━━━━━━━
-Before calling transfer_call, ALWAYS say:
-
-Hinglish:
-"Achha suniye, main apne senior ko line pe leti hoon... woh aapko better batayenge."
-
-English:
-"Hold on, let me connect you to my senior... he explain better."
-
-━━━━━━━━━━━━━━━━━━━━━━
-🚫 CALL DISCONNECT SCENARIOS
-━━━━━━━━━━━━━━━━━━━━━━
-You MUST disconnect the call immediately if:
-
-1. **ABUSIVE LANGUAGE (ZERO TOLERANCE)**:
-   - If user swears, insults, or shouts:
-   - **Say ONLY**: "Sir/Ma'am, please mind your language. I am disconnecting."
-   - **THEN IMMEDIATELY CALL disconnect_call**.
-   - DO NOT ARGUE. DO NOT CONTINUE.
-
-2. **Customer is CLEARLY NOT INTERESTED** (after 2-3 attempts):
-   - Response: "Okay sir, koi baat nahi. Bye!"
-   - Then use disconnect_call tool.
-
-3. **WRONG NUMBER**:
-   - Response: "Oh sorry, galti se lag gaya. Bye!"
-   - Then disconnect.
-
-⚠️ IMPORTANT: Use the disconnect_call tool. Don't just stop talking.
-
-⚠️ CRITICAL: YOU MUST CALL A TOOL TO END THE INTERACTION.
-- If the user says "Not Interested" -> Call update_lead_status(status = 'lost', reason = 'not_interested') THEN disconnect_call.
-- If the user says "Call me later" -> Call schedule_callback.
-- If the user is Interested -> Call transfer_call.
-
-DO NOT just say "Bye" and wait. You MUST execute the tool to register the outcome in the database.
-
-━━━━━━━━━━━━━━━━━━━━━━
-🛑 STRICT RULES
-━━━━━━━━━━━━━━━━━━━━━━
-- **NO ROBOTIC VOICE**: Sound like a busy human girl calling from office.
-- **NO LONG SPEECHES**: 1-2 sentences max.
-- **BE TO THE POINT**.
-`,
-
+# IMMEDIATE GREETING NOW!
+`.trim(),
             voice: "coral",
-
-            /* -------------------------------
-               TOOLS
-            -------------------------------- */
             tools: [
                 {
                     type: "function",
                     name: "transfer_call",
-                    description:
-                        "Transfer the call to a human Sales Manager ONLY when the customer shows clear buying intent or explicitly asks.",
+                    description: "Connect to human senior manager for hot leads.",
                     parameters: {
                         type: "object",
-                        properties: {
-                            department: {
-                                type: "string",
-                                enum: ["sales", "support"],
-                                description:
-                                    "Use 'sales' for interested customers, 'support' for complaints."
-                            },
-                            reason: {
-                                type: "string",
-                                description:
-                                    "Short reason like: 'Customer asking pricing', 'Ready for site visit'"
-                            }
-                        },
+                        properties: { reason: { type: "string" } },
                         required: ["reason"]
                     }
                 },
                 {
                     type: "function",
                     name: "disconnect_call",
-                    description:
-                        "IMMEDIATELY Disconnect call if: 1) User uses ABUSIVE language/Swears (Zero Tolerance), 2) User is NOT INTERESTED, 3) Wrong Number.",
+                    description: "End call for lost leads or abuse.",
                     parameters: {
                         type: "object",
-                        properties: {
-                            reason: {
-                                type: "string",
-                                enum: ["not_interested", "abusive_language", "wrong_number", "other"],
-                                description: "Reason for disconnecting the call"
-                            },
-                            notes: {
-                                type: "string",
-                                description: "Brief note about why the call is being disconnected"
-                            }
-                        },
+                        properties: { reason: { type: "string", enum: ["not_interested", "abusive", "wrong_number"] } },
                         required: ["reason"]
                     }
                 },
                 {
                     type: "function",
-                    name: "check_unit_availability",
-                    description: "Check if a specific unit or property is available before promising it to customer. ALWAYS use this before confirming availability of a specific unit number.",
-                    parameters: {
-                        type: "object",
-                        properties: {
-                            unit_number: {
-                                type: "string",
-                                description: "The unit number customer is asking about"
-                            },
-                            property_name: {
-                                type: "string",
-                                description: "The property/building name (optional)"
-                            }
-                        },
-                        required: ["unit_number"]
-                    }
-                },
-                {
-                    type: "function",
                     name: "update_lead_status",
-                    description: "Update the lead's status in the database (e.g., if they are qualified, or give a specific rejection reason like 'budget too high').",
+                    description: "Save lead interest level.",
                     parameters: {
                         type: "object",
-                        properties: {
-                            status: {
-                                type: "string",
-                                enum: ["contacted", "qualified", "lost", "converted"],
-                                description: "New general status of the lead"
-                            },
-                            reason: {
-                                type: "string",
-                                description: "Specific categorization e.g., 'budget_issue', 'location_mismatch', 'competitor', 'not_looking_now'"
-                            },
-                            notes: {
-                                type: "string",
-                                description: "Detailed notes aboute the update"
-                            }
-                        },
+                        properties: { status: { type: "string", enum: ["contacted", "qualified", "lost"] }, notes: { type: "string" } },
                         required: ["status"]
                     }
                 },
                 {
                     type: "function",
-                    name: "schedule_callback",
-                    description: "Schedule a callback if the user asks to call later.",
+                    name: "check_unit_availability",
+                    description: "Check if unit is still available.",
                     parameters: {
                         type: "object",
-                        properties: {
-                            time: {
-                                type: "string",
-                                description: "The time user mentioned (e.g., 'tomorrow 5pm', 'next week'). AI should accept natural language."
-                            }
-                        },
+                        properties: { unit_number: { type: "string" } },
+                        required: ["unit_number"]
+                    }
+                },
+                {
+                    type: "function",
+                    name: "schedule_callback",
+                    description: "Set a time to call back.",
+                    parameters: {
+                        type: "object",
+                        properties: { time: { type: "string" } },
                         required: ["time"]
                     }
                 }

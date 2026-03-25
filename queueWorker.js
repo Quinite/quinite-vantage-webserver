@@ -1,145 +1,163 @@
-import { createClient } from '@supabase/supabase-js';
-import plivo from 'plivo';
+import { supabase } from './services/supabase.js';
+import { plivoClient, getCallerId } from './services/plivo.js';
 import dotenv from 'dotenv';
-import { dirname, join } from 'path';
+import { dirname } from 'path';
 import { fileURLToPath } from 'url';
 
 // Load environment variables
 const __dirname = dirname(fileURLToPath(import.meta.url));
 dotenv.config();
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
-const PLIVO_AUTH_ID = process.env.PLIVO_AUTH_ID;
-const PLIVO_AUTH_TOKEN = process.env.PLIVO_AUTH_TOKEN;
-const PLIVO_PHONE_NUMBER = process.env.PLIVO_PHONE_NUMBER;
-const WEBSOCKET_SERVER_URL = process.env.WEBSOCKET_SERVER_URL || 'https://vantage-websocket-server.up.railway.app'; // Adjust default
-const NEXT_PUBLIC_SITE_URL = process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000';
-
-if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !PLIVO_AUTH_ID || !PLIVO_AUTH_TOKEN) {
-    console.error("❌ Missing Configuration for Queue Worker");
-    process.exit(1);
-}
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
-const plivoClient = new plivo.Client(PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN);
-
-// RATE LIMIT SETTINGS
-const MAX_CONCURRENT_CALLS_PER_BATCH = 10; // Plivo might limit concurrent channels
+const WEBSOCKET_SERVER_URL = process.env.WEBSOCKET_SERVER_URL || 'https://vantage-websocket-server.up.railway.app';
 const POLL_INTERVAL_MS = 5000;
-const CALLS_PER_SECOND = 2; // Conservative rate limit
+const MAX_CONCURRENT_CALLS = 5; // Reduced for safety & Plivo limits
+const RETRY_DELAY_MINUTES = 15;
 
-console.log("🚀 Starting Queue Worker...");
-console.log(`   Poll Interval: ${POLL_INTERVAL_MS}ms`);
-console.log(`   Rate Limit: ${CALLS_PER_SECOND} calls/sec`);
+console.log("🚀 Starting Optimized Queue Worker...");
+console.log(`📡 WebSocket URL: ${WEBSOCKET_SERVER_URL}`);
 
+/**
+ * Main loop for processing the call queue
+ */
 async function processQueue() {
     try {
-        // 1. Fetch pending items suitable for retry
+        const now = new Date().toISOString();
+
+        // 1. Fetch pending items
+        // We select the oldest items that are due for retry/initial call
         const { data: queueItems, error } = await supabase
             .from('call_queue')
             .select('*')
-            .in('status', ['queued', 'failed']) // processing? No, generic fetch queued
-            .lte('next_retry_at', new Date().toISOString())
-            .lt('attempt_count', 3) // Max retries check
-            .limit(MAX_CONCURRENT_CALLS_PER_BATCH);
+            .in('status', ['queued', 'failed'])
+            .lte('next_retry_at', now)
+            .lt('attempt_count', 3)
+            .order('created_at', { ascending: true })
+            .limit(MAX_CONCURRENT_CALLS);
 
-        if (error) throw error;
-
-        if (!queueItems || queueItems.length === 0) {
-            // console.log("💤 Queue empty...");
+        if (error) {
+            console.error("❌ [Queue Worker] Database fetch error:", error.message);
             return;
         }
 
-        console.log(`📥 [Queue Worker] Processing ${queueItems.length} items from queue...`);
-
-        for (const item of queueItems) {
-            console.log(`▶️ [Queue Worker] Processing Item ID: ${item.id} | Lead: ${item.lead_id}`);
-            await executeCall(item);
-            // Simple Rate Limiting: Sleep between calls
-            await new Promise(r => setTimeout(r, 1000 / CALLS_PER_SECOND));
-            console.log(`⏸️ [Queue Worker] Rate limit sleep done.`);
+        if (!queueItems || queueItems.length === 0) {
+            return;
         }
 
+        console.log(`📥 [Queue Worker] Found ${queueItems.length} items to process.`);
+
+        // Process in parallel with a limit
+        await Promise.allSettled(queueItems.map(item => executeCall(item)));
+
     } catch (err) {
-        console.error("❌ Queue Process Error:", err.message);
+        console.error("❌ [Queue Worker] Loop Error:", err.message);
     }
 }
 
+/**
+ * Internal logic for executing a single call
+ */
 async function executeCall(item) {
-    const { id, lead_id, campaign_id, attempt_count } = item;
+    const { id, lead_id, campaign_id, attempt_count, organization_id } = item;
 
     try {
-        // A. Mark as Processing
-        await supabase.from('call_queue').update({ status: 'processing' }).eq('id', id);
+        // Step A: Immediate Status Update (Prevent Race Conditions)
+        const { data: checkItem, error: checkError } = await supabase
+            .from('call_queue')
+            .update({ status: 'processing', updated_at: new Date() })
+            .match({ id, status: item.status }) // Ensure it's still in the expected state
+            .select()
+            .single();
 
-        // B. Fetch Lead Data (Phone)
-        const { data: lead } = await supabase.from('leads').select('phone, name').eq('id', lead_id).single();
-        if (!lead || !lead.phone) {
-            throw new Error("Invalid Lead or Missing Phone");
+        if (checkError || !checkItem) {
+            console.warn(`⚠️ [Queue Worker] Item ${id} already being processed or missing.`);
+            return;
         }
 
-        console.log(`📞 Dialing ${lead.name} (${lead.phone}) for Campaign ${campaign_id}...`);
+        // Step B: Fetch Comprehensive Lead & Campaign Data
+        const [{ data: lead }, { data: campaign }] = await Promise.all([
+            supabase.from('leads').select('name, phone, project_id').eq('id', lead_id).single(),
+            supabase.from('campaigns').select('name, caller_id').eq('id', campaign_id).single()
+        ]);
 
-        // C. Make Call via Plivo
-        // Use websocket server's answer endpoint if available, else standard webhook
-        // We MUST point to the endpoint that generates the WebSocket XML.
-        // In this repo, that is usually specific.
+        if (!lead?.phone) {
+            throw new Error(`Invalid Lead data for ID ${lead_id}`);
+        }
+
+        const fromNumber = getCallerId(campaign);
+        if (!fromNumber) {
+            throw new Error("Missing mandatory field: from (PLIVO_PHONE_NUMBER)");
+        }
+
+        console.log(`📞 [Queue Worker] Dialing ${lead.name} (${lead.phone}) from ${fromNumber}...`);
+
+        // Step C: Execute Call via Plivo
         const answerUrl = `${WEBSOCKET_SERVER_URL}/answer?leadId=${lead_id}&campaignId=${campaign_id}`;
-
+        
         const response = await plivoClient.calls.create(
-            PLIVO_PHONE_NUMBER,
+            fromNumber,
             lead.phone,
             answerUrl,
             {
                 answer_method: 'POST',
-                // Optional hooks
-                time_limit: 1800
+                time_limit: 1800, // 30 mins max
+                // If Plivo supports tagging, use it
+                extra_params: {
+                    leadId: lead_id,
+                    campaignId: campaign_id
+                }
             }
         );
 
-        console.log(`   ✅ Call Initiated: SID=${response.requestUuid}`);
+        console.log(`✅ [Queue Worker] Call SID: ${response.requestUuid} for Item: ${id}`);
 
-        // D. Success - Update Queue & Lead
+        // Step D: Mark as Completed in Queue
         await supabase.from('call_queue').update({
             status: 'completed',
-            updated_at: new Date()
+            updated_at: new Date(),
+            last_error: null
         }).eq('id', id);
 
-        // Update Lead's own status
+        // Step E: Update Lead Record
         await supabase.from('leads').update({
             call_status: 'calling',
-            call_date: new Date().toISOString()
+            last_contacted_at: new Date().toISOString()
         }).eq('id', lead_id);
 
-        // Update Campaign Stats (Approximate)
-        // We do this individually to keep UI responsive. 
-        // Note: For high volume, an RPC or periodic aggregate would be better.
-        const { data: campaign } = await supabase.from('campaigns').select('total_calls').eq('id', campaign_id).single();
-        if (campaign) {
-            await supabase.from('campaigns').update({
-                total_calls: (campaign.total_calls || 0) + 1
-            }).eq('id', campaign_id);
-        }
-
     } catch (err) {
-        console.error(`   ❌ Call Failed (Attempt ${attempt_count + 1}):`, err.message);
+        const errorMsg = err.message || "Unknown error";
+        console.error(`❌ [Queue Worker] Call execution failed for Item ${id}:`, errorMsg);
 
-        // E. Failure - Schedule Retry
+        // Step F: Failure Logging & Retry Strategy
+        const currentAttempt = attempt_count + 1;
         const nextRetry = new Date();
-        nextRetry.setMinutes(nextRetry.getMinutes() + (5 * (attempt_count + 1))); // Linear backoff: 5m, 10m, 15m
+        
+        // Strategy: Exponential-ish backoff (15m, 30m, 45m)
+        nextRetry.setMinutes(nextRetry.getMinutes() + (RETRY_DELAY_MINUTES * currentAttempt));
 
         await supabase.from('call_queue').update({
-            status: 'failed', // Temporarily failed
-            attempt_count: attempt_count + 1,
-            last_error: err.message,
+            status: 'failed',
+            attempt_count: currentAttempt,
+            last_error: errorMsg,
             next_retry_at: nextRetry.toISOString(),
             updated_at: new Date()
         }).eq('id', id);
+
+        // Log to call_attempts for persistent history
+        await supabase.from('call_attempts').insert({
+            organization_id,
+            lead_id,
+            campaign_id,
+            attempt_number: currentAttempt,
+            channel: 'voice_ai',
+            outcome: 'failed',
+            error_message: errorMsg,
+            attempted_at: new Date().toISOString()
+        });
     }
 }
 
-// Start Polling Loop
+// Start polling
+console.log(`🕒 Polling every ${POLL_INTERVAL_MS}ms`);
 setInterval(processQueue, POLL_INTERVAL_MS);
 
 // Handle graceful shutdown
