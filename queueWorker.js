@@ -156,9 +156,28 @@ async function executeCall(item) {
     }
 }
 
+/**
+ * Cleanup function to reset items stuck in 'processing' state
+ */
+async function cleanupStuckCalls() {
+    try {
+        const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+        const { error } = await supabase
+            .from('call_queue')
+            .update({ status: 'queued', last_error: 'Stuck in processing (Timed out)' })
+            .eq('status', 'processing')
+            .lt('updated_at', tenMinutesAgo);
+
+        if (error) console.error("❌ [Queue Worker] Cleanup error:", error.message);
+    } catch (err) {
+        console.error("❌ [Queue Worker] Cleanup logic error:", err.message);
+    }
+}
+
 // Start polling
 console.log(`🕒 Polling every ${POLL_INTERVAL_MS}ms`);
 setInterval(processQueue, POLL_INTERVAL_MS);
+setInterval(cleanupStuckCalls, 60000); // Check for stuck calls every minute
 
 // Handle graceful shutdown
 process.on('SIGTERM', () => process.exit(0));

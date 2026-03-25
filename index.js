@@ -133,7 +133,17 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
             }
 
             // Wait for both OpenAI and Plivo's 'start' event to ensure audio bridge is ready
+            // We use a 10s timeout to prevent hanging forever if a 'start' event is missed
+            const timeout = setTimeout(() => {
+                if (plivoWS.resolveStart) {
+                    console.warn(`⚠️ [${callSid}] Start event timeout - Proceeding anyway...`);
+                    plivoWS.resolveStart();
+                }
+            }, 10000);
+
             await plivoWS.startPromise;
+            clearTimeout(timeout);
+            
             console.log(`🎤 [${callSid}] AI Greeting Triggered (Audio Bridge Active).`);
 
             // Trigger AI Greeting with initial (lean) prompt for speed ⚡
@@ -461,41 +471,44 @@ wss.on('connection', async (plivoWS, request) => {
         plivoWS.resolveStart = resolve;
     });
 
+    // 1. ATTACH PLIVO MESSAGE HANDLER FIRST (Crucial for Promises) ⚡
+    plivoWS.on('message', (message) => {
+        try {
+            const data = JSON.parse(message);
+            
+            switch (data.event) {
+                case 'media':
+                    if (plivoWS.realtime && plivoWS.realtime.readyState === WebSocket.OPEN) {
+                        plivoWS.realtime.send(JSON.stringify({
+                            type: 'input_audio_buffer.append',
+                            audio: data.media.payload
+                        }));
+                    }
+                    break;
+
+                case 'start':
+                    console.log(`▶️  [${callSid}] Plivo stream started: ${data.start.streamId}`);
+                    plivoWS.streamId = data.start.streamId;
+                    if (plivoWS.resolveStart) plivoWS.resolveStart();
+                    break;
+
+                case 'stop':
+                    console.log(`⏹️  [${callSid}] Plivo stream stopped`);
+                    break;
+
+                case 'clearAudio':
+                    console.log(`🔇 [${callSid}] Clear audio received`);
+                    break;
+            }
+        } catch (err) {
+            console.error(`❌ [${callSid}] Plivo msg error:`, err.message);
+        }
+    });
+
+    // 2. NOW INITIATE AI SESSION
     try {
         const realtimeWS = await startRealtimeWSConnection(plivoWS, leadId, campaignId, callSid);
-
-        plivoWS.on('message', (message) => {
-            try {
-                const data = JSON.parse(message);
-
-                switch (data.event) {
-                    case 'media':
-                        if (realtimeWS.readyState === WebSocket.OPEN) {
-                            realtimeWS.send(JSON.stringify({
-                                type: 'input_audio_buffer.append',
-                                audio: data.media.payload
-                            }));
-                        }
-                        break;
-
-                    case 'start':
-                        console.log(`▶️  [${callSid}] Plivo stream started: ${data.start.streamId}`);
-                        plivoWS.streamId = data.start.streamId;
-                        if (plivoWS.resolveStart) plivoWS.resolveStart();
-                        break;
-
-                    case 'stop':
-                        console.log(`⏹️  [${callSid}] Plivo stream stopped`);
-                        break;
-
-                    case 'clearAudio':
-                        console.log(`🔇 [${callSid}] Clear audio received`);
-                        break;
-                }
-            } catch (err) {
-                console.error(`❌ [${callSid}] Plivo msg error:`, err.message);
-            }
-        });
+        plivoWS.realtime = realtimeWS; // Bind for the message handler above
     } catch (err) {
         console.error(`❌ Connection boot error:`, err.message);
     }
@@ -504,4 +517,6 @@ wss.on('connection', async (plivoWS, request) => {
 server.listen(PORT, () => console.log(`\n✅ Vantage AI Server listening on ${PORT}`));
 
 process.on('uncaughtException', (err) => console.error('💥 CRASH:', err));
-process.on('unhandledRejection', (err) => console.error('💥 REJECTION:', err));
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('💥 REJECTION:', reason);
+});
