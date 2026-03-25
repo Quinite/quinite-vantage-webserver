@@ -186,7 +186,7 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
                 type: "conversation.item.create",
                 item: { type: "function_call_output", call_id, output: JSON.stringify(result) }
             }));
-            
+
             // For certain tools, trigger a response
             if (['check_unit_availability', 'schedule_callback'].includes(name)) {
                 realtimeWS.send(JSON.stringify({ type: 'response.create' }));
@@ -197,7 +197,7 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
         realtimeWS.on('message', async (message) => {
             try {
                 const response = JSON.parse(message);
-                
+
                 switch (response.type) {
                     case 'response.function_call_arguments.done':
                         await handleToolCall(response);
@@ -208,7 +208,7 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
                         if (plivoWS.readyState === WebSocket.OPEN) {
                             plivoWS.send(JSON.stringify({ event: 'clearAudio' }));
                         }
-                        
+
                         // Only cancel if there's possibly a response active
                         // We use a small timeout to avoid hitting cancellation too fast or when not needed
                         realtimeWS.send(JSON.stringify({ type: 'response.cancel' }));
@@ -237,7 +237,7 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
                     case 'response.audio_transcript.done':
                         conversationTranscript += `AI: ${response.transcript}\n`;
                         break;
-                    
+
                     case 'error':
                         // Suppress benign cancellation errors
                         if (response.error?.message?.includes('Cancellation failed')) {
@@ -260,7 +260,7 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
             console.log(`🧹 [${callSid}] Finishing AI Session...`);
 
             if (realtimeWS.readyState === WebSocket.OPEN) realtimeWS.close();
-            
+
             // Final DB synchronization
             if (callLogId) {
                 await finalizeCallOutcome(callLogId, leadId, campaignId, conversationTranscript, callSid);
@@ -328,13 +328,14 @@ async function logCallStart(lead, campaign, callSid) {
 // TOOL: Handlers
 async function handleTransfer(plivoWS, realtimeWS, callSid, leadId, campaignId, args, callLogId) {
     console.log(`📞 Initiating Transfer: ${args.reason}`);
-    
+
     // Dynamic Agent Selection 
     const { data: agents } = await supabase.from('profiles').select('phone, full_name').eq('organization_id', (await supabase.from('leads').select('organization_id').eq('id', leadId).single()).data.organization_id).eq('status', 'active').limit(1);
+    console.log(`Agents: ${JSON.stringify(agents)}`);
     const transferNumber = agents?.[0]?.phone || process.env.PLIVO_TRANSFER_NUMBER || '+918035740007';
 
     const transferUrl = `${process.env.NEXT_PUBLIC_SITE_URL}/api/webhooks/plivo/transfer?to=${encodeURIComponent(transferNumber)}&leadId=${leadId}&campaignId=${campaignId}`;
-    
+
     await plivoClient.calls.transfer(callSid, { legs: 'aleg', aleg_url: transferUrl, aleg_method: 'POST' });
 
     // Update DB
@@ -351,13 +352,13 @@ async function handleTransfer(plivoWS, realtimeWS, callSid, leadId, campaignId, 
 
 async function handleDisconnect(plivoWS, realtimeWS, callSid, leadId, args, callLogId) {
     console.log(`🚫 AI Disconnect: ${args.reason}`);
-    
+
     await supabase.from('call_logs').update({ call_status: 'disconnected', disconnect_reason: args.reason, notes: args.notes }).eq('id', callLogId);
     await supabase.from('leads').update({ rejection_reason: args.reason, call_status: 'called' }).eq('id', leadId);
 
     // Give goodbye window
     setTimeout(async () => {
-        try { await plivoClient.calls.hangup(callSid); } catch (e) {}
+        try { await plivoClient.calls.hangup(callSid); } catch (e) { }
         plivoWS.close();
         realtimeWS.close();
     }, 3000);
@@ -371,14 +372,36 @@ async function handleUpdateLead(leadId, args, callLogId) {
         notes: args.notes,
         call_status: 'contacted'
     }).eq('id', leadId);
-    
+
     return { success: !error };
 }
 
 async function handleAvailability(leadId, args) {
-    const { data: unit } = await supabase.from('property_units').select('*').eq('unit_number', args.unit_number).single();
-    if (!unit) return { available: false, message: "No such unit found." };
-    return { available: unit.status === 'available', price: unit.price, config: unit.bhk_config };
+    try {
+        // 1. Get lead's project context
+        const { data: lead } = await supabase.from('leads').select('project_id').eq('id', leadId).single();
+        if (!lead?.project_id) return { available: false, error: "No project context." };
+
+        // 2. Query units within that project
+        const { data: unit } = await supabase
+            .from('property_units')
+            .select('*, properties(name)')
+            .eq('unit_number', args.unit_number)
+            .eq('project_id', lead.project_id) // STRICT PROJECT FILTER
+            .single();
+
+        if (!unit) return { available: false, message: `Unit ${args.unit_number} not found in this project.` };
+        
+        return { 
+            available: unit.status === 'available', 
+            price: unit.price, 
+            config: unit.bhk_config,
+            area: unit.area_sqft,
+            status: unit.status
+        };
+    } catch (err) {
+        return { available: false, error: "Search failed." };
+    }
 }
 
 async function handleScheduleCallback(leadId, args) {
@@ -394,7 +417,7 @@ async function finalizeCallOutcome(callLogId, leadId, campaignId, transcript, ca
     try {
         const endedAt = new Date();
         const duration = 0; // Simplified
-        
+
         await supabase.from('call_logs').update({
             conversation_transcript: transcript,
             ended_at: endedAt.toISOString()
@@ -440,11 +463,11 @@ wss.on('connection', async (plivoWS, request) => {
 
     try {
         const realtimeWS = await startRealtimeWSConnection(plivoWS, leadId, campaignId, callSid);
-        
+
         plivoWS.on('message', (message) => {
             try {
                 const data = JSON.parse(message);
-                
+
                 switch (data.event) {
                     case 'media':
                         if (realtimeWS.readyState === WebSocket.OPEN) {
