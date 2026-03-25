@@ -132,6 +132,10 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
                 setCachedContext(`campaign_${campaignId}`, campaign);
             }
 
+            // Wait for both OpenAI and Plivo's 'start' event to ensure audio bridge is ready
+            await plivoWS.startPromise;
+            console.log(`🎤 [${callSid}] AI Greeting Triggered (Audio Bridge Active).`);
+
             // Trigger AI Greeting with initial (lean) prompt for speed ⚡
             const initialSession = createSessionUpdate(lead, campaign, [], []);
             realtimeWS.send(JSON.stringify(initialSession));
@@ -215,7 +219,12 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
                         if (plivoWS.readyState === WebSocket.OPEN) {
                             plivoWS.send(JSON.stringify({
                                 event: 'playAudio',
-                                media: { payload: response.delta }
+                                media: {
+                                    contentType: 'audio/x-mulaw',
+                                    sampleRate: 8000,
+                                    payload: response.delta
+                                },
+                                streamId: plivoWS.streamId
                             }));
                         }
                         break;
@@ -424,13 +433,44 @@ wss.on('connection', async (plivoWS, request) => {
         return;
     }
 
+    // Set up a promise to wait for Plivo's 'start' event
+    plivoWS.startPromise = new Promise((resolve) => {
+        plivoWS.resolveStart = resolve;
+    });
+
     try {
         const realtimeWS = await startRealtimeWSConnection(plivoWS, leadId, campaignId, callSid);
         
         plivoWS.on('message', (message) => {
-            const data = JSON.parse(message);
-            if (data.event === 'media' && realtimeWS.readyState === WebSocket.OPEN) {
-                realtimeWS.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: data.media.payload }));
+            try {
+                const data = JSON.parse(message);
+                
+                switch (data.event) {
+                    case 'media':
+                        if (realtimeWS.readyState === WebSocket.OPEN) {
+                            realtimeWS.send(JSON.stringify({
+                                type: 'input_audio_buffer.append',
+                                audio: data.media.payload
+                            }));
+                        }
+                        break;
+
+                    case 'start':
+                        console.log(`▶️  [${callSid}] Plivo stream started: ${data.start.streamId}`);
+                        plivoWS.streamId = data.start.streamId;
+                        if (plivoWS.resolveStart) plivoWS.resolveStart();
+                        break;
+
+                    case 'stop':
+                        console.log(`⏹️  [${callSid}] Plivo stream stopped`);
+                        break;
+
+                    case 'clearAudio':
+                        console.log(`🔇 [${callSid}] Clear audio received`);
+                        break;
+                }
+            } catch (err) {
+                console.error(`❌ [${callSid}] Plivo msg error:`, err.message);
             }
         });
     } catch (err) {
