@@ -1,8 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
 import WebSocket, { WebSocketServer } from 'ws';
 import express from 'express';
-import https from 'https';
-import fs from 'fs';
+import http from 'http';
 import dotenv from 'dotenv';
 import plivo from 'plivo';
 import OpenAI from 'openai';
@@ -14,10 +13,7 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-const server = https.createServer({
-    key: fs.readFileSync('/etc/letsencrypt/live/server.vantage.quinite.co/privkey.pem'),
-    cert: fs.readFileSync('/etc/letsencrypt/live/server.vantage.quinite.co/fullchain.pem')
-}, app);
+const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
 
 const PORT = parseInt(process.env.PORT) || 10000;
@@ -72,7 +68,7 @@ app.all('/answer', (req, res) => {
     const host = headers.host;
     const protocol = headers['x-forwarded-proto'] === 'https' ? 'wss' : 'wss'; // Default to wss
 
-    const wsUrl = `${protocol}://${host}:10000/voice/stream?leadId=${leadId}&campaignId=${campaignId}&callSid=${callUuid}`;
+    const wsUrl = `${protocol}://${host}/voice/stream?leadId=${leadId}&campaignId=${campaignId}&callSid=${callUuid}`;
 
     // XML requires & to be escaped as &amp;
     const xmlWsUrl = wsUrl.replace(/&/g, '&amp;');
