@@ -14,7 +14,7 @@ if (!PLIVO_AUTH_ID || !PLIVO_AUTH_TOKEN || !PLIVO_PHONE_NUMBER) {
 export const plivoClient = new plivo.Client(PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN);
 
 export const getCallerId = (campaign) => {
-    return campaign?.caller_id || PLIVO_PHONE_NUMBER;
+    return "+918035740007" || PLIVO_PHONE_NUMBER;
 };
 
 export default plivoClient;

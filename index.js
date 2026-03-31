@@ -42,20 +42,34 @@ app.get(['/', '/health'], (req, res) => res.send('OK'));
 /**
  * /answer: Plivo webhook that returns XML for WebSocket streaming.
  */
-app.all('/answer', validatePlivoRequest, (req, res) => {
+app.all('/answer', validatePlivoRequest, async (req, res) => {
     const callUuid = req.body.CallUUID || req.query.CallUUID;
     const leadId = req.query.leadId || req.body.leadId;
     const campaignId = req.query.campaignId || req.body.campaignId;
 
     console.log(`📞 [${callUuid}] Incoming Answer Request | Lead: ${leadId}`);
 
+    // [1] HIGH-SPEED LIFECYCLE PRE-CHECK
+    const { data: context } = await supabase
+        .from('leads')
+        .select('campaign:campaigns!inner(status, organization:organizations!inner(subscription_status, credits:call_credits(balance)))')
+        .eq('id', leadId)
+        .single();
+
+    if (!context || context.campaign.status !== 'active' || context.campaign.organization.subscription_status !== 'active' || (context.campaign.organization.credits?.[0]?.balance || 0) < 0.1) {
+        console.warn(`🛑 [${callUuid}] Lifecycle Rejection in /answer. Hanging up.`);
+        return res.set('Content-Type', 'text/xml').send(`<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>`);
+    }
+
     const protocol = req.headers['x-forwarded-proto'] === 'https' ? 'wss' : 'ws';
     const host = req.headers.host;
     const wsUrl = `${protocol}://${host}/voice/stream?leadId=${leadId}&campaignId=${campaignId}&callSid=${callUuid}`;
     const xmlWsUrl = wsUrl.replace(/&/g, '&amp;');
 
+    // Added immediate <Speak> to reduce perceived latency and 'silent call' feedback
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+    <Speak voice="Woman">Hello?</Speak>
     <Stream bidirectional="true" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000">
         ${xmlWsUrl}
     </Stream>
@@ -478,7 +492,11 @@ wss.on('connection', async (plivoWS, request) => {
     const campaignId = url.searchParams.get('campaignId');
     const callSid = url.searchParams.get('callSid');
 
-    plivoWS.startPromise = new Promise((resolve) => { plivoWS.resolveStart = resolve; });
+    plivoWS.startPromise = new Promise((resolve) => { 
+        plivoWS.resolveStart = resolve; 
+        // 5s Safety Timeout for Plivo Start Event
+        setTimeout(() => resolve(), 5000); 
+    });
 
     plivoWS.on('message', (message) => {
         try {

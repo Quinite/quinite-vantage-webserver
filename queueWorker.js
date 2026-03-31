@@ -30,6 +30,7 @@ async function processQueue() {
                     status, 
                     organization:organizations!inner(
                         subscription_status, 
+                        subscription_period_end,
                         credits:call_credits(balance)
                     )
                 )
