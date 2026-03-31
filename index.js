@@ -23,9 +23,15 @@ const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
 const PORT = parseInt(process.env.PORT) || 10000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
+// Security Middleware: Plivo Signature Validation Placeholder
+const validatePlivoRequest = (req, res, next) => {
+    if (process.env.NODE_ENV === 'test') return next();
+    // Implementation: Use Plivo's SDK to validate X-Plivo-Signature-V2
+    next();
+};
+
 console.log(`\n🚀 [Vantage OS] Booting Server...`);
 console.log(`📡 Port: ${PORT}`);
-console.log(`🔑 OpenAI: ${OPENAI_API_KEY ? '✅' : '❌'}`);
 
 /* -------------------------------
    HTTP ENDPOINTS
@@ -36,7 +42,7 @@ app.get(['/', '/health'], (req, res) => res.send('OK'));
 /**
  * /answer: Plivo webhook that returns XML for WebSocket streaming.
  */
-app.all('/answer', (req, res) => {
+app.all('/answer', validatePlivoRequest, (req, res) => {
     const callUuid = req.body.CallUUID || req.query.CallUUID;
     const leadId = req.query.leadId || req.body.leadId;
     const campaignId = req.query.campaignId || req.body.campaignId;
@@ -73,17 +79,14 @@ server.on('upgrade', (request, socket, head) => {
 });
 
 /* -------------------------------
-   SESSION CACHE (Blazing Speed 🚀)
+   SESSION CACHE
 -------------------------------- */
 const contextCache = new Map();
-const CACHE_TTL = 30 * 60 * 1000; // 30 minutes
+const CACHE_TTL = 30 * 60 * 1000;
 
 function getCachedContext(id) {
     const cached = contextCache.get(id);
-    if (cached && (Date.now() - cached.timestamp < CACHE_TTL)) {
-        return cached.data;
-    }
-    return null;
+    return (cached && (Date.now() - cached.timestamp < CACHE_TTL)) ? cached.data : null;
 }
 
 function setCachedContext(id, data) {
@@ -95,10 +98,10 @@ function setCachedContext(id, data) {
 -------------------------------- */
 
 const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) => {
-    console.log(`\n🎯 [${callSid}] INITIALIZING AI SESSION...`);
+    console.log(`\n🎯 [${callSid}] INITIALIZING SEARCH-READY SESSION...`);
 
     try {
-        // Step 1: Initialize OpenAI WebSocket EARLY 🚀
+        // [1] Pre-emptive OpenAI Connection
         const realtimeWS = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview', {
             headers: {
                 'Authorization': `Bearer ${OPENAI_API_KEY}`,
@@ -106,66 +109,82 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
             }
         });
 
-        // Step 2: Parallelize DB Fetching (Lead & Campaign)
-        const fetchContext = Promise.all([
-            supabase.from('leads').select('*, project:projects(*)').eq('id', leadId).single(),
-            supabase.from('campaigns').select('*, organization:organizations(*)').eq('id', campaignId).single()
-        ]);
+        // [2] Optimized Single-Query Context Join
+        const { data: context, error: contextError } = await supabase
+            .from('leads')
+            .select(`
+                *,
+                campaign:campaigns!inner(*, 
+                    organization:organizations!inner(id, subscription_status, credits:call_credits(balance))
+                ),
+                project:projects(*)
+            `)
+            .eq('id', leadId)
+            .single();
+
+        if (contextError || !context) {
+            console.error(`❌ [${callSid}] Handshake Failed:`, contextError?.message);
+            return null;
+        }
+
+        const { campaign, project } = context;
+        const organization = campaign.organization;
+        const balance = organization.credits?.[0]?.balance || 0;
+
+        // [3] Lifecycle & Billing Validation
+        if (campaign.status !== 'active' || (project && project.archived_at)) {
+            console.warn(`🛑 [${callSid}] Campaign/Project Inactive.`);
+            return null;
+        }
+
+        if (organization.subscription_status !== 'active' || balance < 0.5) {
+            console.warn(`💳 [${callSid}] Credits Exhausted/Sub Inactive.`);
+            return null;
+        }
 
         let conversationTranscript = '';
         let callLogId = null;
+        let silenceTimer = null;
 
-        // Step 3: Handle OpenAI Readiness
+        const resetSilenceTimer = () => {
+            if (silenceTimer) clearTimeout(silenceTimer);
+            silenceTimer = setTimeout(async () => {
+                console.log(`🔇 [${callSid}] Silence Timeout (35s).`);
+                await handleDisconnect(plivoWS, realtimeWS, callSid, leadId, { reason: 'silence_timeout' }, callLogId);
+            }, 35000);
+        };
+
+        // Handle OpenAI Readiness
         realtimeWS.on('open', async () => {
-            console.log(`✅ [${callSid}] OpenAI Connected!`);
-
-            // Check Cache for faster context
-            let lead = getCachedContext(`lead_${leadId}`);
-            let campaign = getCachedContext(`campaign_${campaignId}`);
-
-            if (!lead || !campaign) {
-                const [leadRes, campRes] = await fetchContext;
-                if (leadRes.error || campRes.error) return;
-                lead = leadRes.data;
-                campaign = campRes.data;
-                setCachedContext(`lead_${leadId}`, lead);
-                setCachedContext(`campaign_${campaignId}`, campaign);
-            }
-
-            // Wait for both OpenAI and Plivo's 'start' event to ensure audio bridge is ready
-            // We use a 10s timeout to prevent hanging forever if a 'start' event is missed
-            const timeout = setTimeout(() => {
-                if (plivoWS.resolveStart) {
-                    console.warn(`⚠️ [${callSid}] Start event timeout - Proceeding anyway...`);
-                    plivoWS.resolveStart();
-                }
-            }, 10000);
-
-            await plivoWS.startPromise;
-            clearTimeout(timeout);
+            console.log(`✅ [${callSid}] OpenAI Ready!`);
             
-            console.log(`🎤 [${callSid}] AI Greeting Triggered (Audio Bridge Active).`);
-
-            // Trigger AI Greeting with initial (lean) prompt for speed ⚡
-            const initialSession = createSessionUpdate(lead, campaign, [], []);
+            await plivoWS.startPromise;
+            
+            // Handshake context update
+            const initialSession = createSessionUpdate(context, campaign, [], []);
             realtimeWS.send(JSON.stringify(initialSession));
             realtimeWS.send(JSON.stringify({ type: 'response.create' }));
 
-            // Step 4: Background fetch full context (Inventory/Other Projects)
-            fetchFullContext(realtimeWS, lead, campaign, callSid);
+            // Async Context Warming
+            fetchFullContext(realtimeWS, context, campaign, callSid);
 
-            // Step 5: Log the call start
-            callLogId = await logCallStart(lead, campaign, callSid);
+            // Log Session Start
+            callLogId = await logCallStart(context, campaign, callSid);
+            resetSilenceTimer();
         });
 
-        // Step 6: Define Tool Handlers (Centralized)
+        // Tool Execution Management
         const handleToolCall = async (response) => {
             const { name, arguments: argsJson, call_id } = response;
             const args = JSON.parse(argsJson);
-            console.log(`🛠️ [${callSid}] Tool Call: ${name}`, args);
+            
+            // Post-Handshake Credit Pulse Check
+            const { data: creditPulse } = await supabase.from('call_credits').select('balance').eq('organization_id', organization.id).single();
+            if (!creditPulse || creditPulse.balance < 0.1) {
+                return { success: false, error: 'Balance depleted.' };
+            }
 
             let result = { success: false };
-
             try {
                 switch (name) {
                     case 'transfer_call':
@@ -174,39 +193,34 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
                     case 'disconnect_call':
                         result = await handleDisconnect(plivoWS, realtimeWS, callSid, leadId, args, callLogId);
                         break;
-                    case 'update_lead_status':
-                        result = await handleUpdateLead(leadId, args, callLogId);
-                        break;
-                    case 'check_unit_availability':
-                        result = await handleAvailability(leadId, args);
+                    case 'check_detailed_inventory':
+                        result = await handleDetailedInventory(leadId, args);
                         break;
                     case 'schedule_callback':
                         result = await handleScheduleCallback(leadId, args);
                         break;
+                    case 'log_intent':
+                        result = await handleLogIntent(leadId, args, callLogId);
+                        break;
                     default:
-                        console.warn(`⚠️ Unknown Tool: ${name}`);
+                        console.warn(`⚠️ Tool Not Registered: ${name}`);
                 }
             } catch (err) {
-                console.error(`❌ Tool execution error [${name}]:`, err.message);
+                console.error(`❌ Tool Error:`, err.message);
                 result = { success: false, error: err.message };
             }
 
-            // Send tool result back to AI
             realtimeWS.send(JSON.stringify({
                 type: "conversation.item.create",
                 item: { type: "function_call_output", call_id, output: JSON.stringify(result) }
             }));
-
-            // For certain tools, trigger a response
-            if (['check_unit_availability', 'schedule_callback'].includes(name)) {
-                realtimeWS.send(JSON.stringify({ type: 'response.create' }));
-            }
+            realtimeWS.send(JSON.stringify({ type: 'response.create' }));
         };
 
-        // Step 7: Handle Messages
         realtimeWS.on('message', async (message) => {
             try {
                 const response = JSON.parse(message);
+                resetSilenceTimer();
 
                 switch (response.type) {
                     case 'response.function_call_arguments.done':
@@ -214,64 +228,36 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
                         break;
 
                     case 'input_audio_buffer.speech_started':
-                        // INTERRUPT LOGIC: Stop AI audio and clear Plivo buffer ⚡
                         if (plivoWS.readyState === WebSocket.OPEN) {
                             plivoWS.send(JSON.stringify({ event: 'clearAudio' }));
                         }
-
-                        // Only cancel if there's possibly a response active
-                        // We use a small timeout to avoid hitting cancellation too fast or when not needed
                         realtimeWS.send(JSON.stringify({ type: 'response.cancel' }));
                         break;
 
                     case 'response.audio.delta':
-                        // STREAM AUDIO to Plivo 🎬
                         if (plivoWS.readyState === WebSocket.OPEN) {
                             plivoWS.send(JSON.stringify({
                                 event: 'playAudio',
-                                media: {
-                                    contentType: 'audio/x-mulaw',
-                                    sampleRate: 8000,
-                                    payload: response.delta
-                                },
+                                media: { payload: response.delta },
                                 streamId: plivoWS.streamId
                             }));
                         }
                         break;
 
                     case 'conversation.item.input_audio_transcription.completed':
-                        console.log(`👤 [${callSid}] User: "${response.transcript}"`);
                         conversationTranscript += `User: ${response.transcript}\n`;
                         break;
 
                     case 'response.audio_transcript.done':
                         conversationTranscript += `AI: ${response.transcript}\n`;
                         break;
-
-                    case 'error':
-                        // Suppress benign cancellation errors
-                        if (response.error?.message?.includes('Cancellation failed')) {
-                            // console.log(`ℹ️ [${callSid}] Benign cancellation error suppressed.`);
-                            return;
-                        }
-                        console.error(`❌ [${callSid}] AI Error:`, response.error?.message);
-                        break;
                 }
-            } catch (err) {
-                console.error(`❌ Message processing error:`, err.message);
-            }
+            } catch (err) { }
         });
 
-        // Step 8: Cleanup & Finalization
-        let cleanedUp = false;
         const cleanup = async () => {
-            if (cleanedUp) return;
-            cleanedUp = true;
-            console.log(`🧹 [${callSid}] Finishing AI Session...`);
-
+            if (silenceTimer) clearTimeout(silenceTimer);
             if (realtimeWS.readyState === WebSocket.OPEN) realtimeWS.close();
-
-            // Final DB synchronization
             if (callLogId) {
                 await finalizeCallOutcome(callLogId, leadId, campaignId, conversationTranscript, callSid);
             }
@@ -283,43 +269,33 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
         return realtimeWS;
 
     } catch (err) {
-        console.error(`❌ Fatal Session Error [${callSid}]:`, err.message);
         plivoWS.close();
         return null;
     }
 };
 
 /* -------------------------------
-   HELPER FUNCTIONS (MODULARIZED)
+   MODULAR UTILS
 -------------------------------- */
 
 async function fetchFullContext(realtimeWS, lead, campaign, callSid) {
     try {
-        const cacheKey = `full_context_${campaign.organization_id}_${lead.project_id}`;
-        let fullData = getCachedContext(cacheKey);
+        const cacheKey = `projects_${campaign.organization_id}`;
+        let projects = getCachedContext(cacheKey);
 
-        if (!fullData) {
-            console.log(`📦 [${callSid}] Fetching full context from DB...`);
-            const [projectsRes, inventoryRes] = await Promise.all([
-                supabase.from('projects').select('name, description, location').eq('organization_id', campaign.organization_id).eq('status', 'active'),
-                supabase.from('properties').select('*').eq('project_id', lead.project_id).eq('status', 'available')
-            ]);
-            fullData = { projects: projectsRes.data || [], inventory: inventoryRes.data || [] };
-            setCachedContext(cacheKey, fullData);
+        if (!projects) {
+            const { data } = await supabase.from('projects').select('name, description, location').eq('organization_id', campaign.organization_id).eq('status', 'active');
+            projects = data || [];
+            setCachedContext(cacheKey, projects);
         }
 
-        const fullSession = createSessionUpdate(lead, campaign, fullData.projects, fullData.inventory);
-        if (realtimeWS.readyState === WebSocket.OPEN) {
-            realtimeWS.send(JSON.stringify(fullSession));
-            console.log(`✅ [${callSid}] Rich Context Attached (Cached).`);
-        }
-    } catch (err) {
-        console.error(`❌ Context fetch error:`, err.message);
-    }
+        const fullSession = createSessionUpdate(lead, campaign, projects, []);
+        if (realtimeWS.readyState === WebSocket.OPEN) realtimeWS.send(JSON.stringify(fullSession));
+    } catch (err) { }
 }
 
 async function logCallStart(lead, campaign, callSid) {
-    const { data, error } = await supabase.from('call_logs').insert({
+    const { data } = await supabase.from('call_logs').insert({
         organization_id: campaign.organization_id,
         project_id: campaign.project_id,
         campaign_id: campaign.id,
@@ -330,129 +306,170 @@ async function logCallStart(lead, campaign, callSid) {
         caller_number: getCallerId(campaign),
         callee_number: lead.phone
     }).select('id').single();
-
-    if (error) console.error(`❌ Log start error:`, error.message);
     return data?.id;
 }
 
-// TOOL: Handlers
-async function handleTransfer(plivoWS, realtimeWS, callSid, leadId, campaignId, args, callLogId) {
-    console.log(`📞 Initiating Transfer: ${args.reason}`);
+async function handleDetailedInventory(leadId, args) {
+    const { data: lead } = await supabase.from('leads').select('project_id').eq('id', leadId).single();
+    if (!lead?.project_id) return { success: false, error: "Project context missing." };
 
-    // Dynamic Agent Selection 
-    const { data: agents } = await supabase.from('profiles').select('phone, full_name').eq('organization_id', (await supabase.from('leads').select('organization_id').eq('id', leadId).single()).data.organization_id).eq('status', 'active').limit(1);
-    console.log(`Agents: ${JSON.stringify(agents)}`);
-    const transferNumber = agents?.[0]?.phone || process.env.PLIVO_TRANSFER_NUMBER || '+918035740007';
+    // [1] ADVANCED JOINED QUERY: Units + Towers + UnitConfigs
+    let query = supabase.from('units').select(`
+        id, unit_number, floor_number, facing, total_price, base_price,
+        bedrooms, bathrooms, balconies, is_corner, is_vastu_compliant,
+        possession_date, construction_status, transaction_type,
+        tower:towers(name, total_floors),
+        config:unit_configs(
+            config_name, category, property_type, 
+            carpet_area, built_up_area, super_built_up_area, plot_area
+        )
+    `)
+    .eq('project_id', lead.project_id)
+    .eq('status', 'available')
+    .is('archived_at', null)
+    .is('is_archived', false);
 
-    const transferUrl = `${process.env.NEXT_PUBLIC_SITE_URL}/api/webhooks/plivo/transfer?to=${encodeURIComponent(transferNumber)}&leadId=${leadId}&campaignId=${campaignId}`;
+    // [2] GRANULAR FILTERING LOGIC
+    if (args.category) query = query.eq('unit_configs.category', args.category.toLowerCase());
+    if (args.transaction_type) query = query.eq('transaction_type', args.transaction_type.toLowerCase());
+    if (args.property_type) query = query.ilike('unit_configs.property_type', `%${args.property_type}%`);
+    
+    // Config Name vs Bedrooms (Handle 1BHK, 2BHK etc)
+    if (args.config_name) query = query.ilike('unit_configs.config_name', `%${args.config_name}%`);
+    if (args.bedrooms) query = query.eq('bedrooms', args.bedrooms);
+    
+    // Pricing Filters
+    if (args.price_min) query = query.gte('total_price', args.price_min);
+    if (args.price_max) query = query.lte('total_price', args.price_max);
+    
+    // Area Filters
+    if (args.min_carpet_area) query = query.gte('unit_configs.carpet_area', args.min_carpet_area);
+    
+    // Architectural Filters
+    if (args.is_vastu_compliant !== undefined) query = query.eq('is_vastu_compliant', args.is_vastu_compliant);
+    if (args.is_corner !== undefined) query = query.eq('is_corner', args.is_corner);
+    if (args.facing) query = query.ilike('facing', `%${args.facing}%`);
+    
+    // Floor Filters
+    if (args.floor_min) query = query.gte('floor_number', args.floor_min);
+    if (args.floor_max) query = query.lte('floor_number', args.floor_max);
 
-    await plivoClient.calls.transfer(callSid, { legs: 'aleg', aleg_url: transferUrl, aleg_method: 'POST' });
+    const { data: units, error } = await query.limit(5);
+    
+    if (error) {
+        console.error("❌ Inventory Query Error:", error.message);
+        return { success: false, error: "Search logic failed." };
+    }
 
-    // Update DB
-    await supabase.from('call_logs').update({ transferred: true, call_status: 'transferred', transfer_reason: args.reason }).eq('id', callLogId);
-    await supabase.from('leads').update({ transferred_to_human: true }).eq('id', leadId);
+    if (!units?.length) {
+        return { 
+            available: false, 
+            message: "No units found matching these exact filters. Try broadening the search (e.g. different floor or BHK)." 
+        };
+    }
 
-    // Stop AI
-    plivoWS.send(JSON.stringify({ event: 'clearAudio' }));
-    realtimeWS.send(JSON.stringify({ type: 'response.cancel' }));
-    setTimeout(() => { plivoWS.close(); realtimeWS.close(); }, 500);
-
-    return { success: true, agent: agents?.[0]?.full_name || 'Senior Manager' };
+    // [3] RICH DATA TRANSFORMATION
+    return { 
+        available: true, 
+        units: units.map(u => ({
+            unit_id: u.id,
+            unit_no: u.unit_number,
+            tower: u.tower?.name,
+            floor: u.floor_number,
+            config: u.config?.config_name,
+            category: u.config?.category,
+            type: u.config?.property_type,
+            transaction: u.transaction_type,
+            bedrooms: u.bedrooms,
+            bathrooms: u.bathrooms,
+            balconies: u.balconies,
+            area: {
+                carpet: u.config?.carpet_area,
+                built_up: u.config?.built_up_area || u.built_up_area,
+                super_built: u.config?.super_built_up_area || u.super_built_up_area,
+                plot: u.config?.plot_area || u.plot_area
+            },
+            price: u.total_price || u.base_price,
+            facing: u.facing,
+            vastu: u.is_vastu_compliant ? 'Yes' : 'No',
+            corner_unit: u.is_corner ? 'Yes' : 'No',
+            possession: u.possession_date,
+            construction: u.construction_status?.replace('_', ' ')
+        }))
+    };
 }
 
-async function handleDisconnect(plivoWS, realtimeWS, callSid, leadId, args, callLogId) {
-    console.log(`🚫 AI Disconnect: ${args.reason}`);
-
-    await supabase.from('call_logs').update({ call_status: 'disconnected', disconnect_reason: args.reason, notes: args.notes }).eq('id', callLogId);
-    await supabase.from('leads').update({ rejection_reason: args.reason, call_status: 'called' }).eq('id', leadId);
-
-    // Give goodbye window
-    setTimeout(async () => {
-        try { await plivoClient.calls.hangup(callSid); } catch (e) { }
-        plivoWS.close();
-        realtimeWS.close();
-    }, 3000);
-
-    return { success: true };
-}
-
-async function handleUpdateLead(leadId, args, callLogId) {
+async function handleLogIntent(leadId, args, callLogId) {
     const { error } = await supabase.from('leads').update({
-        interest_level: args.status === 'qualified' ? 'high' : 'low',
-        notes: args.notes,
-        call_status: 'contacted'
+        interest_level: args.interest_level,
+        min_budget: args.budget_min,
+        max_budget: args.budget_max,
+        category_interest: args.category?.toLowerCase(),
+        property_type_interest: args.property_type,
+        transaction_type_interest: args.transaction_type?.toLowerCase(),
+        preferred_bhk: args.config_preference || args.bhk,
+        preferences: {
+            vastu_required: args.is_vastu_required,
+            preferred_facing: args.preferred_facing,
+            balconies_needed: args.balconies
+        },
+        pain_points: args.pain_points
     }).eq('id', leadId);
+    
+    await supabase.from('call_logs').update({
+        ai_metadata: args
+    }).eq('id', callLogId);
 
     return { success: !error };
 }
 
-async function handleAvailability(leadId, args) {
-    try {
-        // 1. Get lead's project context
-        const { data: lead } = await supabase.from('leads').select('project_id').eq('id', leadId).single();
-        if (!lead?.project_id) return { available: false, error: "No project context." };
+async function handleTransfer(plivoWS, realtimeWS, callSid, leadId, campaignId, args, callLogId) {
+    const { data: org } = await supabase.from('leads').select('organization_id').eq('id', leadId).single();
+    const { data: agents } = await supabase.from('profiles').select('phone, full_name').eq('organization_id', org.organization_id).eq('role', 'employee').eq('status', 'active').limit(1);
+    
+    const target = agents?.[0]?.phone || process.env.PLIVO_TRANSFER_NUMBER;
+    const url = `${process.env.NEXT_PUBLIC_SITE_URL}/api/webhooks/plivo/transfer?to=${encodeURIComponent(target)}&leadId=${leadId}&campaignId=${campaignId}`;
 
-        // 2. Query units within that project
-        const { data: unit } = await supabase
-            .from('property_units')
-            .select('*, properties(name)')
-            .eq('unit_number', args.unit_number)
-            .eq('project_id', lead.project_id) // STRICT PROJECT FILTER
-            .single();
+    await plivoClient.calls.transfer(callSid, { legs: 'aleg', aleg_url: url, aleg_method: 'POST' });
+    await supabase.from('call_logs').update({ transferred: true, call_status: 'transferred' }).eq('id', callLogId);
 
-        if (!unit) return { available: false, message: `Unit ${args.unit_number} not found in this project.` };
-        
-        return { 
-            available: unit.status === 'available', 
-            price: unit.price, 
-            config: unit.bhk_config,
-            area: unit.area_sqft,
-            status: unit.status
-        };
-    } catch (err) {
-        return { available: false, error: "Search failed." };
-    }
+    plivoWS.send(JSON.stringify({ event: 'clearAudio' }));
+    setTimeout(() => { plivoWS.close(); realtimeWS.close(); }, 700);
+    return { success: true, agent: agents?.[0]?.full_name || 'Senior Consultant' };
+}
+
+async function handleDisconnect(plivoWS, realtimeWS, callSid, leadId, args, callLogId) {
+    await supabase.from('call_logs').update({ 
+        call_status: 'completed', 
+        disconnect_reason: args.reason 
+    }).eq('id', callLogId);
+    
+    setTimeout(async () => {
+        try { await plivoClient.calls.hangup(callSid); } catch (e) { }
+        plivoWS.close();
+        realtimeWS.close();
+    }, 2000);
+    return { success: true };
 }
 
 async function handleScheduleCallback(leadId, args) {
     const { error } = await supabase.from('leads').update({
-        waiting_status: 'callback_scheduled',
-        callback_time_text: args.time,
-        notes: `AI Scheduled callback: ${args.time}`
+        best_contact_time: args.time,
+        preferred_contact_method: 'call',
+        waiting_status: 'callback_scheduled'
     }).eq('id', leadId);
-    return { success: !error, message: `Callback noted for ${args.time}` };
+    return { success: !error };
 }
 
 async function finalizeCallOutcome(callLogId, leadId, campaignId, transcript, callSid) {
     try {
-        const endedAt = new Date();
-        const duration = 0; // Simplified
-
-        await supabase.from('call_logs').update({
-            conversation_transcript: transcript,
-            ended_at: endedAt.toISOString()
-        }).eq('id', callLogId);
-
-        // Run analysis in background
+        await supabase.from('call_logs').update({ conversation_transcript: transcript, ended_at: new Date().toISOString() }).eq('id', callLogId);
         analyzeSentiment(transcript, leadId, callLogId, null, callSid);
-
-        // Update retry status if no answer
-        if (transcript.length < 50) {
-            await supabase.from('call_attempts').insert({
-                lead_id: leadId,
-                campaign_id: campaignId,
-                outcome: 'no_answer',
-                will_retry: true,
-                next_retry_at: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString()
-            });
-        }
-    } catch (err) {
-        console.error(`❌ Finalization error:`, err.message);
-    }
+    } catch (err) { }
 }
 
 /* -------------------------------
-   MAIN CONNECTION HANDLER
+   WS HANDLER
 -------------------------------- */
 
 wss.on('connection', async (plivoWS, request) => {
@@ -461,62 +478,22 @@ wss.on('connection', async (plivoWS, request) => {
     const campaignId = url.searchParams.get('campaignId');
     const callSid = url.searchParams.get('callSid');
 
-    if (!leadId || !campaignId || !callSid) {
-        plivoWS.close(1008, 'Missing params');
-        return;
-    }
+    plivoWS.startPromise = new Promise((resolve) => { plivoWS.resolveStart = resolve; });
 
-    // Set up a promise to wait for Plivo's 'start' event
-    plivoWS.startPromise = new Promise((resolve) => {
-        plivoWS.resolveStart = resolve;
-    });
-
-    // 1. ATTACH PLIVO MESSAGE HANDLER FIRST (Crucial for Promises) ⚡
     plivoWS.on('message', (message) => {
         try {
             const data = JSON.parse(message);
-            
-            switch (data.event) {
-                case 'media':
-                    if (plivoWS.realtime && plivoWS.realtime.readyState === WebSocket.OPEN) {
-                        plivoWS.realtime.send(JSON.stringify({
-                            type: 'input_audio_buffer.append',
-                            audio: data.media.payload
-                        }));
-                    }
-                    break;
-
-                case 'start':
-                    console.log(`▶️  [${callSid}] Plivo stream started: ${data.start.streamId}`);
-                    plivoWS.streamId = data.start.streamId;
-                    if (plivoWS.resolveStart) plivoWS.resolveStart();
-                    break;
-
-                case 'stop':
-                    console.log(`⏹️  [${callSid}] Plivo stream stopped`);
-                    break;
-
-                case 'clearAudio':
-                    console.log(`🔇 [${callSid}] Clear audio received`);
-                    break;
+            if (data.event === 'media' && plivoWS.realtime?.readyState === WebSocket.OPEN) {
+                plivoWS.realtime.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: data.media.payload }));
+            } else if (data.event === 'start') {
+                plivoWS.streamId = data.start.streamId;
+                if (plivoWS.resolveStart) plivoWS.resolveStart();
             }
-        } catch (err) {
-            console.error(`❌ [${callSid}] Plivo msg error:`, err.message);
-        }
+        } catch (err) { }
     });
 
-    // 2. NOW INITIATE AI SESSION
-    try {
-        const realtimeWS = await startRealtimeWSConnection(plivoWS, leadId, campaignId, callSid);
-        plivoWS.realtime = realtimeWS; // Bind for the message handler above
-    } catch (err) {
-        console.error(`❌ Connection boot error:`, err.message);
-    }
+    const realtimeWS = await startRealtimeWSConnection(plivoWS, leadId, campaignId, callSid);
+    if (!realtimeWS) { plivoWS.close(); } else { plivoWS.realtime = realtimeWS; }
 });
 
 server.listen(PORT, () => console.log(`\n✅ Vantage AI Server listening on ${PORT}`));
-
-process.on('uncaughtException', (err) => console.error('💥 CRASH:', err));
-process.on('unhandledRejection', (reason, promise) => {
-    console.error('💥 REJECTION:', reason);
-});
