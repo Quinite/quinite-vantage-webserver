@@ -26,13 +26,20 @@ async function processQueue() {
             .from('call_queue')
             .select(`
                 *,
-                campaign:campaigns!inner(status, organization:organizations!inner(subscription_status, credits:call_credits(balance)))
+                campaign:campaigns!inner(
+                    status, 
+                    organization:organizations!inner(
+                        subscription_status, 
+                        credits:call_credits(balance)
+                    )
+                )
             `)
             .in('status', ['queued', 'failed'])
             .lte('next_retry_at', now)
             .lt('attempt_count', 4)
             .eq('campaign.status', 'active') // Only active campaigns
-            .eq('campaign.organization.subscription_status', 'active') // Only active subscriptions
+            .eq('campaign.organization.subscription_status', 'active') // Cached status check
+            .gte('campaign.organization.subscription_period_end', now) // Ensure plan isn't expired
             .order('priority', { ascending: false }) // High priority first
             .order('created_at', { ascending: true }) // Oldest first within priority
             .limit(MAX_CONCURRENT_CALLS);
