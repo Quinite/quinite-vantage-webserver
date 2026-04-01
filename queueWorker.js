@@ -21,16 +21,17 @@ async function processQueue() {
     try {
         const now = new Date().toISOString();
         console.log(`📥 [Queue Worker] Heartbeat: ${now}`);
-        // [1] OPTIMIZED POLLING: Using raw table joins for maximum compatibility
-        const { data: queueItems, error } = await supabase
+        // [1] POLLING: Nested .in() filters are NOT supported by Supabase JS SDK
+        // We fetch all pending items then filter in JS
+        const { data: rawItems, error } = await supabase
             .from('call_queue')
             .select(`
                 *,
-                campaign:campaigns!inner(
+                campaign:campaigns(
                     status,
                     ai_script,
                     call_settings,
-                    organization:organizations!inner(
+                    organization:organizations(
                         subscription_status,
                         call_credits(*)
                     )
@@ -39,16 +40,25 @@ async function processQueue() {
             .in('status', ['queued', 'failed'])
             .lte('next_retry_at', now)
             .lt('attempt_count', 4)
-            .in('campaign.status', ['active', 'running']) 
-            .in('campaign.organization.subscription_status', ['active', 'trialing'])
-            .order('priority', { ascending: false }) 
-            .order('created_at', { ascending: true }) 
-            .limit(MAX_CONCURRENT_CALLS);
+            .order('priority', { ascending: false })
+            .order('created_at', { ascending: true })
+            .limit(50);
 
-        if (error) {
-            console.error("❌ Queue fetch error:", error.message);
+        // JS-level filter for campaign and subscription status
+        const queueItems = (rawItems || []).filter(item => {
+            const campStatus = item.campaign?.status;
+            const subStatus = item.campaign?.organization?.subscription_status;
+            return ['active', 'running'].includes(campStatus) && ['active', 'trialing'].includes(subStatus);
+        }).slice(0, MAX_CONCURRENT_CALLS);
+
+        const queueError = error;
+
+        if (queueError) {
+            console.error("❌ Queue fetch error:", queueError.message);
             return;
         }
+
+        console.log(`📊 [Queue Worker] Found ${rawItems?.length || 0} raw items, ${queueItems.length} eligible after filtering.`);
 
         if (!queueItems?.length) {
             console.log('😴 [Queue Worker] No calls ready to process.');
@@ -100,18 +110,19 @@ async function executeCall(item) {
         if (leadContext.project?.archived_at) throw new Error("PROJECT_ARCHIVED");
 
         // [3] PHONE FORMATTING (Strict E.164)
-        const fromNumber = String(getCallerId(campaign)).trim();
+        const rawFrom = process.env.PLIVO_PHONE_NUMBER || '';
+        const fromNumber = rawFrom.startsWith('+') ? rawFrom.trim() : `+${rawFrom.replace(/\D/g, '')}`;
         const rawTo = String(leadContext.phone).trim();
         const formattedTo = rawTo.startsWith('+') ? rawTo : `+${rawTo.replace(/\D/g, '')}`;
         const answerUrl = `${process.env.WEBSOCKET_SERVER_URL}/answer?leadId=${lead_id}&campaignId=${campaign_id}`;
 
-        if (!fromNumber.startsWith('+') || fromNumber.length < 10) throw new Error("INVALID_SENDER_ID");
-        if (formattedTo.length < 10) throw new Error("INVALID_DESTINATION_FORMAT");
-
-        console.log(`\n📞 [Queue Worker] DISPATCHING CALL:`);
-        console.log(`   📤 FROM: ${fromNumber}`);
-        console.log(`   📥 TO: ${formattedTo} (${leadContext.name})`);
+        console.log(`\n📞 [Queue Worker] PRE-DISPATCH CHECK:`);
+        console.log(`   📤 FROM raw: '${rawFrom}' → formatted: '${fromNumber}'`);
+        console.log(`   📥 TO raw: '${leadContext.phone}' → formatted: '${formattedTo}'`);
         console.log(`   🔗 URL: ${answerUrl}`);
+
+        if (!fromNumber || !fromNumber.startsWith('+') || fromNumber.replace(/\D/g, '').length < 10) throw new Error(`INVALID_SENDER_ID: '${fromNumber}'`);
+        if (!formattedTo || formattedTo.replace(/\D/g, '').length < 10) throw new Error(`INVALID_DESTINATION_FORMAT: '${formattedTo}'`);
 
         // [4] PLIVO DISPATCH (Hardened Positional Args)
         const response = await plivoClient.calls.create(
