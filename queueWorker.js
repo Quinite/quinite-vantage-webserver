@@ -32,7 +32,7 @@ async function processQueue() {
                     call_settings,
                     organization:organizations!inner(
                         subscription_status,
-                        credits:call_credits(balance)
+                        credits:call_credits(*)
                     )
                 )
             `)
@@ -71,20 +71,15 @@ async function processQueue() {
 async function executeCall(item) {
     const { id, lead_id, campaign_id, attempt_count, organization_id, campaign } = item;
 
-    // [DEBUG] DATA AUDIT
-    const balance = parseFloat(campaign?.organization?.credits?.[0]?.balance || 
-                               campaign?.organization?.call_credits?.[0]?.balance || 0);
+    // [DEBUG] FULL FORENSICS
+    const creditsObj = campaign?.organization?.credits?.[0] || campaign?.organization?.call_credits?.[0];
+    const balanceValue = creditsObj ? creditsObj.balance : "NOT_FOUND";
     
-    if (balance < 0.2) {
-        console.log(`🕵️ [v4-HARDEN] DEBUG DATA:`, JSON.stringify({
-            item_id: id,
-            campaign_status: campaign?.status,
-            org_status: campaign?.organization?.subscription_status,
-            has_credits_array: !!campaign?.organization?.credits,
-            has_call_credits_array: !!campaign?.organization?.call_credits,
-            balance_found: balance
-        }, null, 2));
+    if (balanceValue === "NOT_FOUND" || parseFloat(balanceValue) < 0.2) {
+        console.log(`🕵️ [v4-HARDEN] FULL CREDIT RECORD:`, JSON.stringify(creditsObj || "RECORDS_EMPTY", null, 2));
     }
+
+    const balance = parseFloat(balanceValue === "NOT_FOUND" ? 0 : balanceValue);
 
     try {
         // [1] ATOMIC LOCK: Prevent double-calling
