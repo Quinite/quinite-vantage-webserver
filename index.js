@@ -542,4 +542,8 @@ wss.on('connection', async (plivoWS, request) => {
     }
 });
 
+wss.on('error', (error) => {
+    console.error('❌ WebSocket server error:', error);
+});
+
 server.listen(PORT, () => console.log(`\n✅ Vantage AI Server listening on ${PORT}`));
