@@ -143,31 +143,37 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
             .from('leads')
             .select(`
                 *,
-                campaign:campaigns!inner(*, 
-                    organization:organizations!inner(id, subscription_status, credits:call_credits(balance))
-                ),
                 project:projects(*)
             `)
             .eq('id', leadId)
             .single();
 
-        if (contextError || !context) {
-            console.error(`❌ [${callSid}] Handshake Failed:`, contextError?.message);
+        // Fetch campaign independently (leads may not be linked to campaigns yet)
+        const { data: campaignData } = await supabase
+            .from('campaigns')
+            .select('*, organization:organizations!inner(id, subscription_status, call_credits(*))')
+            .eq('id', campaignId)
+            .single();
+
+        if (contextError || !context || !campaignData) {
+            console.error(`❌ [${callSid}] Handshake Failed:`, contextError?.message || 'Missing campaign');
             return null;
         }
 
-        const { campaign, project } = context;
+        const campaign = campaignData;
+        const project = context.project;
         const organization = campaign.organization;
-        const balance = organization.credits?.[0]?.balance || 0;
+        const credits = organization?.call_credits;
+        const balance = Array.isArray(credits) ? parseFloat(credits[0]?.balance || 0) : parseFloat(credits?.balance || 0);
 
         // [3] Lifecycle & Billing Validation
-        if (campaign.status !== 'active' || (project && project.archived_at)) {
-            console.warn(`🛑 [${callSid}] Campaign/Project Inactive.`);
+        if (!['active', 'running'].includes(campaign.status) || (project && project.archived_at)) {
+            console.warn(`🛑 [${callSid}] Campaign/Project Inactive (${campaign.status}).`);
             return null;
         }
 
-        if (organization.subscription_status !== 'active' || balance < 0.5) {
-            console.warn(`💳 [${callSid}] Credits Exhausted/Sub Inactive.`);
+        if (!['active', 'trialing'].includes(organization.subscription_status) || balance < 0.5) {
+            console.warn(`💳 [${callSid}] Credits Exhausted/Sub Inactive (Sub: ${organization.subscription_status}, Bal: ${balance}).`);
             return null;
         }
 
@@ -190,7 +196,7 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
             await plivoWS.startPromise;
 
             // Handshake context update
-            const initialSession = createSessionUpdate(context, campaign, [], []);
+            const initialSession = createSessionUpdate({ ...context, campaign }, campaign, [], []);
             realtimeWS.send(JSON.stringify(initialSession));
             realtimeWS.send(JSON.stringify({ type: 'response.create' }));
 
