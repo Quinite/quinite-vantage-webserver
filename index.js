@@ -18,7 +18,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 const server = http.createServer(app);
-const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
+const wss = new WebSocketServer({ server, perMessageDeflate: false });
 
 const PORT = parseInt(process.env.PORT) || 10000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -98,17 +98,8 @@ app.all('/answer', validatePlivoRequest, async (req, res) => {
    WEBSOCKET UPGRADE
 -------------------------------- */
 
-server.on('upgrade', (request, socket, head) => {
-    console.log(`🔄 [WS Upgrade] URL: ${request.url}`);
-    if (request.url.startsWith('/voice/stream')) {
-        wss.handleUpgrade(request, socket, head, (ws) => {
-            wss.emit('connection', ws, request);
-        });
-    } else {
-        console.warn(`⚠️ [WS Upgrade] Rejected unknown path: ${request.url}`);
-        socket.destroy();
-    }
-});
+// WebSocket upgrade is handled automatically by wss attached to server
+console.log('✅ [WS] WebSocket server attached to HTTP server.');
 
 /* -------------------------------
    SESSION CACHE
