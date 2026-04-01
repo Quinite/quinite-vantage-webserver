@@ -20,18 +20,7 @@ console.log("🚀 Starting Production-Grade Queue Worker...");
 async function processQueue() {
     try {
         const now = new Date().toISOString();
-        console.log(`📥 [v4-HARDEN] Heartbeat: Checking for pending calls at ${now}...`);
-
-        // [0] DIAGNOSTIC: Raw check for ANY queued/failed items (bypassing joins)
-        const { count: rawCount } = await supabase
-            .from('call_queue')
-            .select('*', { count: 'exact', head: true })
-            .in('status', ['queued', 'failed']);
-            
-        if (rawCount > 0) {
-            console.log(`📊 [v4-HARDEN] Diagnostic: Found ${rawCount} items in (queued/failed) status (pre-filter).`);
-        }
-
+        console.log(`📥 [v4-HARDEN] Heartbeat: ${now}`);
         // [1] ADVANCED POLLING: Priority + Status + Retry Logic
         const { data: queueItems, error } = await supabase
             .from('call_queue')
@@ -48,7 +37,7 @@ async function processQueue() {
             .in('status', ['queued', 'failed'])
             .lte('next_retry_at', now)
             .lt('attempt_count', 4)
-            .eq('campaign.status', 'active') 
+            .in('campaign.status', ['active', 'running']) // Support both naming conventions
             .order('priority', { ascending: false }) 
             .order('created_at', { ascending: true }) 
             .limit(MAX_CONCURRENT_CALLS);
