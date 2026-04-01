@@ -47,24 +47,25 @@ app.all('/answer', validatePlivoRequest, async (req, res) => {
     const leadId = req.query.leadId || req.body.leadId;
     const campaignId = req.query.campaignId || req.body.campaignId;
 
-    console.log(`📞 [${callUuid}] Incoming Answer Request | Lead: ${leadId}`);
+    console.log(`📞 [${callUuid}] Incoming Answer | Lead: ${leadId} | Campaign: ${campaignId}`);
 
-    // [1] HIGH-SPEED LIFECYCLE & BILLING PRE-CHECK (v2 Revamp Plan: Cached Status)
-    // const { data: context } = await supabase
-    //     .from('leads')
-    //     .select('campaign:campaigns!inner(status, organization:organizations!inner(subscription_status, call_credits(*)))')
-    //     .eq('id', leadId)
-    //     .single();
+    // [1] DIRECT CAMPAIGN & BILLING CHECK (v2 Revamp Plan: Cached Status)
+    const { data: campaignContext } = await supabase
+        .from('campaigns')
+        .select('status, organization:organizations!inner(subscription_status, call_credits(*))')
+        .eq('id', campaignId)
+        .single();
 
-    // const credits = context?.campaign?.organization?.call_credits;
-    // const balance = credits ? parseFloat(credits.balance) : 0;
-    // const subStatus = context?.campaign?.organization?.subscription_status || 'inactive';
-    // const campaignStatus = context?.campaign?.status || 'inactive';
+    const credits = campaignContext?.organization?.call_credits;
+    // Smart balance read: handles both object and array responses from Supabase
+    const balance = Array.isArray(credits) ? parseFloat(credits[0]?.balance || 0) : parseFloat(credits?.balance || 0);
+    const subStatus = campaignContext?.organization?.subscription_status || 'inactive';
+    const campaignStatus = campaignContext?.status || 'inactive';
 
-    // if (!context || !['active', 'running'].includes(campaignStatus) || !['active', 'trialing'].includes(subStatus) || balance < 0.1) {
-    //     console.warn(`🛑 [${callUuid}] Lifecycle/Credit Rejection (Camp: ${campaignStatus}, Sub: ${subStatus}, Balance: ${balance}). Hanging up.`);
-    //     return res.set('Content-Type', 'text/xml').send(`<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>`);
-    // }
+    if (!campaignContext || !['active', 'running'].includes(campaignStatus) || !['active', 'trialing'].includes(subStatus) || balance < 0.1) {
+        console.warn(`🛑 [${callUuid}] Lifecycle/Credit Rejection (Camp: ${campaignStatus}, Sub: ${subStatus}, Balance: ${balance}). Hanging up.`);
+        return res.set('Content-Type', 'text/xml').send(`<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>`);
+    }
 
     // Resolve WebSocket Base URL (Secure Only)
     let wsBaseUrl = process.env.WEBSOCKET_SERVER_URL || process.env.WS_URL;
@@ -185,9 +186,9 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
         // Handle OpenAI Readiness
         realtimeWS.on('open', async () => {
             console.log(`✅ [${callSid}] OpenAI Ready!`);
-            
+
             await plivoWS.startPromise;
-            
+
             // Handshake context update
             const initialSession = createSessionUpdate(context, campaign, [], []);
             realtimeWS.send(JSON.stringify(initialSession));
@@ -205,7 +206,7 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
         const handleToolCall = async (response) => {
             const { name, arguments: argsJson, call_id } = response;
             const args = JSON.parse(argsJson);
-            
+
             // Post-Handshake Credit Pulse Check
             const { data: creditPulse } = await supabase.from('call_credits').select('balance').eq('organization_id', organization.id).single();
             if (!creditPulse || creditPulse.balance < 0.1) {
@@ -352,53 +353,53 @@ async function handleDetailedInventory(leadId, args) {
             carpet_area, built_up_area, super_built_up_area, plot_area
         )
     `)
-    .eq('project_id', lead.project_id)
-    .eq('status', 'available')
-    .is('archived_at', null)
-    .is('is_archived', false);
+        .eq('project_id', lead.project_id)
+        .eq('status', 'available')
+        .is('archived_at', null)
+        .is('is_archived', false);
 
     // [2] GRANULAR FILTERING LOGIC
     if (args.category) query = query.eq('unit_configs.category', args.category.toLowerCase());
     if (args.transaction_type) query = query.eq('transaction_type', args.transaction_type.toLowerCase());
     if (args.property_type) query = query.ilike('unit_configs.property_type', `%${args.property_type}%`);
-    
+
     // Config Name vs Bedrooms (Handle 1BHK, 2BHK etc)
     if (args.config_name) query = query.ilike('unit_configs.config_name', `%${args.config_name}%`);
     if (args.bedrooms) query = query.eq('bedrooms', args.bedrooms);
-    
+
     // Pricing Filters
     if (args.price_min) query = query.gte('total_price', args.price_min);
     if (args.price_max) query = query.lte('total_price', args.price_max);
-    
+
     // Area Filters
     if (args.min_carpet_area) query = query.gte('unit_configs.carpet_area', args.min_carpet_area);
-    
+
     // Architectural Filters
     if (args.is_vastu_compliant !== undefined) query = query.eq('is_vastu_compliant', args.is_vastu_compliant);
     if (args.is_corner !== undefined) query = query.eq('is_corner', args.is_corner);
     if (args.facing) query = query.ilike('facing', `%${args.facing}%`);
-    
+
     // Floor Filters
     if (args.floor_min) query = query.gte('floor_number', args.floor_min);
     if (args.floor_max) query = query.lte('floor_number', args.floor_max);
 
     const { data: units, error } = await query.limit(5);
-    
+
     if (error) {
         console.error("❌ Inventory Query Error:", error.message);
         return { success: false, error: "Search logic failed." };
     }
 
     if (!units?.length) {
-        return { 
-            available: false, 
-            message: "No units found matching these exact filters. Try broadening the search (e.g. different floor or BHK)." 
+        return {
+            available: false,
+            message: "No units found matching these exact filters. Try broadening the search (e.g. different floor or BHK)."
         };
     }
 
     // [3] RICH DATA TRANSFORMATION
-    return { 
-        available: true, 
+    return {
+        available: true,
         units: units.map(u => ({
             unit_id: u.id,
             unit_no: u.unit_number,
@@ -443,7 +444,7 @@ async function handleLogIntent(leadId, args, callLogId) {
         },
         pain_points: args.pain_points
     }).eq('id', leadId);
-    
+
     await supabase.from('call_logs').update({
         ai_metadata: args
     }).eq('id', callLogId);
@@ -454,7 +455,7 @@ async function handleLogIntent(leadId, args, callLogId) {
 async function handleTransfer(plivoWS, realtimeWS, callSid, leadId, campaignId, args, callLogId) {
     const { data: org } = await supabase.from('leads').select('organization_id').eq('id', leadId).single();
     const { data: agents } = await supabase.from('profiles').select('phone, full_name').eq('organization_id', org.organization_id).eq('role', 'employee').eq('status', 'active').limit(1);
-    
+
     const target = agents?.[0]?.phone || process.env.PLIVO_TRANSFER_NUMBER;
     const url = `${process.env.NEXT_PUBLIC_SITE_URL}/api/webhooks/plivo/transfer?to=${encodeURIComponent(target)}&leadId=${leadId}&campaignId=${campaignId}`;
 
@@ -467,11 +468,11 @@ async function handleTransfer(plivoWS, realtimeWS, callSid, leadId, campaignId, 
 }
 
 async function handleDisconnect(plivoWS, realtimeWS, callSid, leadId, args, callLogId) {
-    await supabase.from('call_logs').update({ 
-        call_status: 'completed', 
-        disconnect_reason: args.reason 
+    await supabase.from('call_logs').update({
+        call_status: 'completed',
+        disconnect_reason: args.reason
     }).eq('id', callLogId);
-    
+
     setTimeout(async () => {
         try { await plivoClient.calls.hangup(callSid); } catch (e) { }
         plivoWS.close();
@@ -506,10 +507,10 @@ wss.on('connection', async (plivoWS, request) => {
     const campaignId = url.searchParams.get('campaignId');
     const callSid = url.searchParams.get('callSid');
 
-    plivoWS.startPromise = new Promise((resolve) => { 
-        plivoWS.resolveStart = resolve; 
+    plivoWS.startPromise = new Promise((resolve) => {
+        plivoWS.resolveStart = resolve;
         // 5s Safety Timeout for Plivo Start Event
-        setTimeout(() => resolve(), 5000); 
+        setTimeout(() => resolve(), 5000);
     });
 
     plivoWS.on('message', (message) => {
