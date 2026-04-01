@@ -90,6 +90,7 @@ app.all('/answer', validatePlivoRequest, async (req, res) => {
     </Stream>
 </Response>`;
 
+    console.log(`📤 [Answer] Sending XML to Plivo. Stream URL: ${wsUrl}`);
     res.set('Content-Type', 'text/xml').send(xml.trim());
 });
 
@@ -98,11 +99,13 @@ app.all('/answer', validatePlivoRequest, async (req, res) => {
 -------------------------------- */
 
 server.on('upgrade', (request, socket, head) => {
+    console.log(`🔄 [WS Upgrade] URL: ${request.url}`);
     if (request.url.startsWith('/voice/stream')) {
         wss.handleUpgrade(request, socket, head, (ws) => {
             wss.emit('connection', ws, request);
         });
     } else {
+        console.warn(`⚠️ [WS Upgrade] Rejected unknown path: ${request.url}`);
         socket.destroy();
     }
 });
