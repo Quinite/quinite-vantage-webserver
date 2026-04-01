@@ -21,15 +21,17 @@ async function processQueue() {
     try {
         const now = new Date().toISOString();
         console.log(`📥 [v4-HARDEN] Heartbeat: ${now}`);
-        // [1] ADVANCED POLLING: Priority + Status + Retry Logic
+        // [1] OPTIMIZED POLLING: Using cached subscription_status for high-speed dialing
         const { data: queueItems, error } = await supabase
             .from('call_queue')
             .select(`
                 *,
                 campaign:campaigns!inner(
-                    status, 
+                    status,
+                    ai_script,
+                    call_settings,
                     organization:organizations!inner(
-                        subscription_status, 
+                        subscription_status,
                         credits:call_credits(balance)
                     )
                 )
@@ -37,7 +39,8 @@ async function processQueue() {
             .in('status', ['queued', 'failed'])
             .lte('next_retry_at', now)
             .lt('attempt_count', 4)
-            .in('campaign.status', ['active', 'running']) // Support both naming conventions
+            .in('campaign.status', ['active', 'running']) 
+            .in('campaign.organization.subscription_status', ['active', 'trialing'])
             .order('priority', { ascending: false }) 
             .order('created_at', { ascending: true }) 
             .limit(MAX_CONCURRENT_CALLS);
@@ -67,10 +70,12 @@ async function processQueue() {
  */
 async function executeCall(item) {
     const { id, lead_id, campaign_id, attempt_count, organization_id, campaign } = item;
-    const balance = campaign.organization.credits?.[0]?.balance || 0;
+    
+    // Credit Logic Check
+    const balance = parseFloat(campaign.organization.credits?.[0]?.balance || 0);
 
     try {
-        // [2] ATOMIC LOCK: Prevent double-calling
+        // [1] ATOMIC LOCK: Prevent double-calling
         const { data: lockedItem, error: lockError } = await supabase
             .from('call_queue')
             .update({ status: 'processing', updated_at: new Date() })
@@ -79,8 +84,8 @@ async function executeCall(item) {
 
         if (lockError || !lockedItem) return;
 
-        // [3] LIFECYCLE & BILLING HEARTBEAT
-        if (balance < 0.5) throw new Error("INSUFFICIENT_FUNDS");
+        // [2] BILLING & DATA HEARTBEAT
+        if (balance < 0.2) throw new Error("INSUFFICIENT_FUNDS");
 
         const { data: leadContext } = await supabase
             .from('leads')
@@ -88,67 +93,59 @@ async function executeCall(item) {
             .eq('id', lead_id)
             .single();
 
-        if (!leadContext || !leadContext.phone) throw new Error("INVALID_LEAD");
+        if (!leadContext || !leadContext.phone) throw new Error("INVALID_LEAD_DATA");
         if (leadContext.project?.archived_at) throw new Error("PROJECT_ARCHIVED");
 
-        // [3] ANALYTICAL VALIDATION
-        const fromNumber = getCallerId(campaign);
-        const rawPhone = leadContext.phone;
-        const formattedPhone = rawPhone.startsWith('+') ? rawPhone : `+${rawPhone.replace(/\D/g, '')}`;
-        const answerUrl = `${WEBSOCKET_SERVER_URL}/answer?leadId=${lead_id}&campaignId=${campaign_id}`;
+        // [3] PHONE FORMATTING (Strict E.164)
+        const fromNumber = String(getCallerId(campaign)).trim();
+        const rawTo = String(leadContext.phone).trim();
+        const formattedTo = rawTo.startsWith('+') ? rawTo : `+${rawTo.replace(/\D/g, '')}`;
+        const answerUrl = `${process.env.WEBSOCKET_SERVER_URL}/answer?leadId=${lead_id}&campaignId=${campaign_id}`;
 
-        console.log(`\n📞 [Queue Worker] ATTEMPTING CALL:`);
+        if (!fromNumber.startsWith('+') || fromNumber.length < 10) throw new Error("INVALID_SENDER_ID");
+        if (formattedTo.length < 10) throw new Error("INVALID_DESTINATION_FORMAT");
+
+        console.log(`\n📞 [Queue Worker] DISPATCHING CALL:`);
         console.log(`   📤 FROM: ${fromNumber}`);
-        console.log(`   📥 TO: ${formattedPhone} (${leadContext.name})`);
+        console.log(`   📥 TO: ${formattedTo} (${leadContext.name})`);
         console.log(`   🔗 URL: ${answerUrl}`);
 
-        if (!fromNumber || fromNumber === 'undefined') throw new Error("MISSING_FROM_NUMBER");
-        if (!formattedPhone || formattedPhone.length < 10) throw new Error("INVALID_DESTINATION_NUMBER");
-        if (!WEBSOCKET_SERVER_URL || WEBSOCKET_SERVER_URL.includes('your-websocket-server')) throw new Error("INVALID_SERVER_CONFIG");
-
-        // [4] PLIVO INITIATION (Hardened Positional Args for max compatibility)
-        const callFrom = String(fromNumber || process.env.PLIVO_PHONE_NUMBER || "+918035740007");
-        const callTo = String(formattedPhone);
-        const callUrl = String(answerUrl);
-
-        console.log(`📡 [Queue Worker] DISPATCHING (Positional):`);
-        console.log(`   - FROM: "${callFrom}" (type: ${typeof callFrom})`);
-        console.log(`   - TO:   "${callTo}" (type: ${typeof callTo})`);
-        console.log(`   - URL:  "${callUrl}" (type: ${typeof callUrl})`);
-
+        // [4] PLIVO DISPATCH (Hardened Positional Args)
         const response = await plivoClient.calls.create(
-            callFrom,
-            callTo,
-            callUrl,
+            fromNumber,
+            formattedTo,
+            answerUrl,
             {
                 answer_method: 'POST',
-                time_limit: 1200,
+                time_limit: 1800, // 30 mins max
                 machine_detection: 'hangup'
             }
         );
 
-        console.log(`✅ [Queue Worker] Call Initiated. SID: ${response.requestUuid || response.callUuid}`);
+        const callSid = response.requestUuid || response.callUuid;
+        console.log(`✅ [Queue Worker] SUCCESS | SID: ${callSid}`);
 
-        // [5] SUCCESS LOGGING
+        // [5] UPDATE STATE
         await supabase.from('call_queue').update({ status: 'completed', updated_at: new Date() }).eq('id', id);
         await supabase.from('leads').update({ call_status: 'calling', last_contacted_at: new Date().toISOString() }).eq('id', lead_id);
 
     } catch (err) {
-        console.error(`❌ Call Failed [Item ${id}]:`, err.message);
+        console.error(`❌ [Queue Worker] FAILURE [Item ${id}]:`, err.message);
         
         const nextRetry = new Date();
-        const backoff = (attempt_count + 1) * RETRY_DELAY_MINUTES;
-        nextRetry.setMinutes(nextRetry.getMinutes() + backoff);
+        const backoffMinutes = (attempt_count + 1) * 30; // 30, 60, 90 mins backoff
+        nextRetry.setMinutes(nextRetry.getMinutes() + backoffMinutes);
 
+        // Update Queue Item with Error Detail
         await supabase.from('call_queue').update({
-            status: err.message === 'INSUFFICIENT_FUNDS' ? 'queued' : 'failed', // Don't burn attempts on billing errors
+            status: err.message === 'INSUFFICIENT_FUNDS' ? 'queued' : 'failed',
             attempt_count: err.message === 'INSUFFICIENT_FUNDS' ? attempt_count : attempt_count + 1,
             last_error: err.message,
-            next_retry_at: err.message === 'INSUFFICIENT_FUNDS' ? new Date(Date.now() + 60000).toISOString() : nextRetry.toISOString(),
+            next_retry_at: err.message === 'INSUFFICIENT_FUNDS' ? new Date(Date.now() + 300000).toISOString() : nextRetry.toISOString(),
             updated_at: new Date()
         }).eq('id', id);
 
-        // Persistent failure log
+        // Audit Log Entry
         await supabase.from('call_attempts').insert({
             organization_id, lead_id, campaign_id,
             attempt_number: attempt_count + 1,
