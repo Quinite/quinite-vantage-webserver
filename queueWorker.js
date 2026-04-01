@@ -70,9 +70,21 @@ async function processQueue() {
  */
 async function executeCall(item) {
     const { id, lead_id, campaign_id, attempt_count, organization_id, campaign } = item;
+
+    // [DEBUG] DATA AUDIT
+    const balance = parseFloat(campaign?.organization?.credits?.[0]?.balance || 
+                               campaign?.organization?.call_credits?.[0]?.balance || 0);
     
-    // Credit Logic Check
-    const balance = parseFloat(campaign.organization.credits?.[0]?.balance || 0);
+    if (balance < 0.2) {
+        console.log(`🕵️ [v4-HARDEN] DEBUG DATA:`, JSON.stringify({
+            item_id: id,
+            campaign_status: campaign?.status,
+            org_status: campaign?.organization?.subscription_status,
+            has_credits_array: !!campaign?.organization?.credits,
+            has_call_credits_array: !!campaign?.organization?.call_credits,
+            balance_found: balance
+        }, null, 2));
+    }
 
     try {
         // [1] ATOMIC LOCK: Prevent double-calling
