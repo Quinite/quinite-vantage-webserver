@@ -50,21 +50,21 @@ app.all('/answer', validatePlivoRequest, async (req, res) => {
     console.log(`📞 [${callUuid}] Incoming Answer Request | Lead: ${leadId}`);
 
     // [1] HIGH-SPEED LIFECYCLE & BILLING PRE-CHECK (v2 Revamp Plan: Cached Status)
-    const { data: context } = await supabase
-        .from('leads')
-        .select('campaign:campaigns!inner(status, organization:organizations!inner(subscription_status, call_credits(*)))')
-        .eq('id', leadId)
-        .single();
+    // const { data: context } = await supabase
+    //     .from('leads')
+    //     .select('campaign:campaigns!inner(status, organization:organizations!inner(subscription_status, call_credits(*)))')
+    //     .eq('id', leadId)
+    //     .single();
 
-    const credits = context?.campaign?.organization?.call_credits;
-    const balance = credits ? parseFloat(credits.balance) : 0;
-    const subStatus = context?.campaign?.organization?.subscription_status || 'inactive';
-    const campaignStatus = context?.campaign?.status || 'inactive';
+    // const credits = context?.campaign?.organization?.call_credits;
+    // const balance = credits ? parseFloat(credits.balance) : 0;
+    // const subStatus = context?.campaign?.organization?.subscription_status || 'inactive';
+    // const campaignStatus = context?.campaign?.status || 'inactive';
 
-    if (!context || !['active', 'running'].includes(campaignStatus) || !['active', 'trialing'].includes(subStatus) || balance < 0.1) {
-        console.warn(`🛑 [${callUuid}] Lifecycle/Credit Rejection (Camp: ${campaignStatus}, Sub: ${subStatus}, Balance: ${balance}). Hanging up.`);
-        return res.set('Content-Type', 'text/xml').send(`<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>`);
-    }
+    // if (!context || !['active', 'running'].includes(campaignStatus) || !['active', 'trialing'].includes(subStatus) || balance < 0.1) {
+    //     console.warn(`🛑 [${callUuid}] Lifecycle/Credit Rejection (Camp: ${campaignStatus}, Sub: ${subStatus}, Balance: ${balance}). Hanging up.`);
+    //     return res.set('Content-Type', 'text/xml').send(`<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>`);
+    // }
 
     // Resolve WebSocket Base URL (Secure Only)
     let wsBaseUrl = process.env.WEBSOCKET_SERVER_URL || process.env.WS_URL;
