@@ -59,9 +59,10 @@ app.all('/answer', validatePlivoRequest, async (req, res) => {
     const credits = context?.campaign?.organization?.call_credits;
     const balance = credits ? parseFloat(credits.balance) : 0;
     const subStatus = context?.campaign?.organization?.subscription_status || 'inactive';
+    const campaignStatus = context?.campaign?.status || 'inactive';
 
-    if (!context || context.campaign.status !== 'active' || !['active', 'trialing'].includes(subStatus) || balance < 0.1) {
-        console.warn(`🛑 [${callUuid}] Lifecycle/Credit Rejection (Sub: ${subStatus}, Balance: ${balance}). Hanging up.`);
+    if (!context || !['active', 'running'].includes(campaignStatus) || !['active', 'trialing'].includes(subStatus) || balance < 0.1) {
+        console.warn(`🛑 [${callUuid}] Lifecycle/Credit Rejection (Camp: ${campaignStatus}, Sub: ${subStatus}, Balance: ${balance}). Hanging up.`);
         return res.set('Content-Type', 'text/xml').send(`<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>`);
     }
 
