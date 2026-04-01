@@ -287,7 +287,9 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
                         conversationTranscript += `AI: ${response.transcript}\n`;
                         break;
                 }
-            } catch (err) { }
+            } catch (err) {
+                console.error(`❌ [${callSid}] Message handler error:`, err.message);
+            }
         });
 
         const cleanup = async () => {
@@ -304,6 +306,7 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
         return realtimeWS;
 
     } catch (err) {
+        console.error(`❌ [${callSid}] startRealtimeWSConnection CRASH:`, err.message, err.stack);
         plivoWS.close();
         return null;
     }
@@ -528,11 +531,20 @@ wss.on('connection', async (plivoWS, request) => {
                 plivoWS.streamId = data.start.streamId;
                 if (plivoWS.resolveStart) plivoWS.resolveStart();
             }
-        } catch (err) { }
+        } catch (err) {
+            console.error(`❌ [WS] Plivo message parse error:`, err.message);
+        }
     });
 
+    console.log(`🔌 [WS] New connection | Lead: ${leadId} | Campaign: ${campaignId} | CallSid: ${callSid}`);
+
     const realtimeWS = await startRealtimeWSConnection(plivoWS, leadId, campaignId, callSid);
-    if (!realtimeWS) { plivoWS.close(); } else { plivoWS.realtime = realtimeWS; }
+    if (!realtimeWS) {
+        console.error(`❌ [WS] startRealtimeWSConnection returned null — closing plivoWS.`);
+        plivoWS.close();
+    } else {
+        plivoWS.realtime = realtimeWS;
+    }
 });
 
 server.listen(PORT, () => console.log(`\n✅ Vantage AI Server listening on ${PORT}`));
