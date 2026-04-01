@@ -25,7 +25,6 @@ export async function analyzeSentiment(transcript, leadId, callLogId, organizati
                 Extract structured insights focused on the lead's intent and budget.
                 Return JSON: {
                   "sentiment_score": float (-1 to 1),
-                  "sentiment_label": "Positive" | "Neutral" | "Negative",
                   "interest_level": "high" | "medium" | "low" | "none",
                   "summary": "1-sentence conversational summary",
                   "objections": ["list", "of", "objections"],
@@ -47,7 +46,6 @@ export async function analyzeSentiment(transcript, leadId, callLogId, organizati
         const { error: callLogError } = await supabase.from('call_logs').update({
             summary: analysis.summary,
             sentiment_score: analysis.sentiment_score,
-            sentiment_label: analysis.sentiment_label,
             interest_level: analysis.interest_level,
             ai_metadata: {
                 objections: analysis.objections,
