@@ -20,8 +20,8 @@ console.log("🚀 Starting Production-Grade Queue Worker...");
 async function processQueue() {
     try {
         const now = new Date().toISOString();
-        console.log(`📥 [v4-HARDEN] Heartbeat: ${now}`);
-        // [1] OPTIMIZED POLLING: Using cached subscription_status for high-speed dialing
+        console.log(`📥 [Queue Worker] Heartbeat: ${now}`);
+        // [1] OPTIMIZED POLLING: Using raw table joins for maximum compatibility
         const { data: queueItems, error } = await supabase
             .from('call_queue')
             .select(`
@@ -32,7 +32,7 @@ async function processQueue() {
                     call_settings,
                     organization:organizations!inner(
                         subscription_status,
-                        credits:call_credits(*)
+                        call_credits(*)
                     )
                 )
             `)
@@ -71,15 +71,13 @@ async function processQueue() {
 async function executeCall(item) {
     const { id, lead_id, campaign_id, attempt_count, organization_id, campaign } = item;
 
-    // [DEBUG] FULL FORENSICS
-    const creditsObj = campaign?.organization?.credits?.[0] || campaign?.organization?.call_credits?.[0];
-    const balanceValue = creditsObj ? creditsObj.balance : "NOT_FOUND";
+    // Credit Balance Check
+    const creditsArr = campaign?.organization?.call_credits;
+    const balance = creditsArr?.[0] ? parseFloat(creditsArr[0].balance) : 0;
     
-    if (balanceValue === "NOT_FOUND" || parseFloat(balanceValue) < 0.2) {
-        console.log(`🕵️ [v4-HARDEN] FULL CREDIT RECORD:`, JSON.stringify(creditsObj || "RECORDS_EMPTY", null, 2));
+    if (balance < 0.2) {
+        console.warn(`🛑 [Queue Worker] Insufficient Credits for Org ${organization_id} (Balance: ${balance})`);
     }
-
-    const balance = parseFloat(balanceValue === "NOT_FOUND" ? 0 : balanceValue);
 
     try {
         // [1] ATOMIC LOCK: Prevent double-calling
