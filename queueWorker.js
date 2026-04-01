@@ -55,8 +55,6 @@ async function processQueue() {
             return;
         }
 
-        console.log(`🕵️ [DEBUG] RAW DATA (First Item):`, JSON.stringify(queueItems[0].campaign?.organization, null, 2));
-
         // Parallel execution with atomic lock handling in executeCall
         await Promise.allSettled(queueItems.map(item => executeCall(item)));
 
@@ -71,9 +69,9 @@ async function processQueue() {
 async function executeCall(item) {
     const { id, lead_id, campaign_id, attempt_count, organization_id, campaign } = item;
 
-    // Credit Balance Check
-    const creditsArr = campaign?.organization?.call_credits;
-    const balance = creditsArr?.[0] ? parseFloat(creditsArr[0].balance) : 0;
+    // Credit Balance Check (Supabase returns 1-to-1 as object in this join)
+    const credits = campaign?.organization?.call_credits;
+    const balance = credits ? parseFloat(credits.balance) : 0;
     
     if (balance < 0.2) {
         console.warn(`🛑 [Queue Worker] Insufficient Credits for Org ${organization_id} (Balance: ${balance})`);

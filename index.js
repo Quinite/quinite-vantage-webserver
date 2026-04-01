@@ -52,11 +52,12 @@ app.all('/answer', validatePlivoRequest, async (req, res) => {
     // [1] HIGH-SPEED LIFECYCLE & BILLING PRE-CHECK (v2 Revamp Plan: Cached Status)
     const { data: context } = await supabase
         .from('leads')
-        .select('campaign:campaigns!inner(status, organization:organizations!inner(subscription_status, credits:call_credits(balance)))')
+        .select('campaign:campaigns!inner(status, organization:organizations!inner(subscription_status, call_credits(*)))')
         .eq('id', leadId)
         .single();
 
-    const balance = parseFloat(context?.campaign?.organization?.credits?.[0]?.balance || 0);
+    const credits = context?.campaign?.organization?.call_credits;
+    const balance = credits ? parseFloat(credits.balance) : 0;
     const subStatus = context?.campaign?.organization?.subscription_status || 'inactive';
 
     if (!context || context.campaign.status !== 'active' || !['active', 'trialing'].includes(subStatus) || balance < 0.1) {
