@@ -22,6 +22,16 @@ async function processQueue() {
         const now = new Date().toISOString();
         console.log(`📥 [v4-HARDEN] Heartbeat: Checking for pending calls at ${now}...`);
 
+        // [0] DIAGNOSTIC: Raw check for ANY queued/failed items (bypassing joins)
+        const { count: rawCount } = await supabase
+            .from('call_queue')
+            .select('*', { count: 'exact', head: true })
+            .in('status', ['queued', 'failed']);
+            
+        if (rawCount > 0) {
+            console.log(`📊 [v4-HARDEN] Diagnostic: Found ${rawCount} items in (queued/failed) status (pre-filter).`);
+        }
+
         // [1] ADVANCED POLLING: Priority + Status + Retry Logic
         const { data: queueItems, error } = await supabase
             .from('call_queue')
@@ -31,7 +41,6 @@ async function processQueue() {
                     status, 
                     organization:organizations!inner(
                         subscription_status, 
-                        subscription_period_end,
                         credits:call_credits(balance)
                     )
                 )
@@ -39,11 +48,9 @@ async function processQueue() {
             .in('status', ['queued', 'failed'])
             .lte('next_retry_at', now)
             .lt('attempt_count', 4)
-            .eq('campaign.status', 'active') // Only active campaigns
-            .eq('campaign.organization.subscription_status', 'active') // Cached status check
-            // REMOVED FOR DEBUGGING: .gte('campaign.organization.subscription_period_end', now)
-            .order('priority', { ascending: false }) // High priority first
-            .order('created_at', { ascending: true }) // Oldest first within priority
+            .eq('campaign.status', 'active') 
+            .order('priority', { ascending: false }) 
+            .order('created_at', { ascending: true }) 
             .limit(MAX_CONCURRENT_CALLS);
 
         if (error) {
