@@ -20,6 +20,7 @@ console.log("🚀 Starting Production-Grade Queue Worker...");
 async function processQueue() {
     try {
         const now = new Date().toISOString();
+        console.log(`📥 [Queue Worker] Heartbeat: Checking for pending calls at ${now}...`);
 
         // [1] ADVANCED POLLING: Priority + Status + Retry Logic
         const { data: queueItems, error } = await supabase
@@ -40,7 +41,7 @@ async function processQueue() {
             .lt('attempt_count', 4)
             .eq('campaign.status', 'active') // Only active campaigns
             .eq('campaign.organization.subscription_status', 'active') // Cached status check
-            .gte('campaign.organization.subscription_period_end', now) // Ensure plan isn't expired
+            // REMOVED FOR DEBUGGING: .gte('campaign.organization.subscription_period_end', now)
             .order('priority', { ascending: false }) // High priority first
             .order('created_at', { ascending: true }) // Oldest first within priority
             .limit(MAX_CONCURRENT_CALLS);
@@ -50,9 +51,12 @@ async function processQueue() {
             return;
         }
 
-        if (!queueItems?.length) return;
+        if (!queueItems?.length) {
+            console.log('😴 [Queue Worker] No calls ready to process.');
+            return;
+        }
 
-        console.log(`📥 Processing ${queueItems.length} priority items.`);
+        console.log(`📥 [Queue Worker] Found ${queueItems.length} items to process.`);
 
         // Parallel execution with atomic lock handling in executeCall
         await Promise.allSettled(queueItems.map(item => executeCall(item)));
@@ -106,19 +110,26 @@ async function executeCall(item) {
         if (!formattedPhone || formattedPhone.length < 10) throw new Error("INVALID_DESTINATION_NUMBER");
         if (!WEBSOCKET_SERVER_URL || WEBSOCKET_SERVER_URL.includes('your-websocket-server')) throw new Error("INVALID_SERVER_CONFIG");
 
-        // [4] PLIVO INITIATION (v4 SDK requires a SINGLE object with snake_case parameters)
-        const callParams = {
-            from: fromNumber,
-            to: formattedPhone,
-            answer_url: answerUrl,
-            answer_method: 'POST',
-            time_limit: 1200,
-            machine_detection: 'hangup'
-        };
+        // [4] PLIVO INITIATION (Hardened Positional Args for max compatibility)
+        const callFrom = String(fromNumber || process.env.PLIVO_PHONE_NUMBER || "+918035740007");
+        const callTo = String(formattedPhone);
+        const callUrl = String(answerUrl);
 
-        console.log(`📡 [Queue Worker] Dispatching to Plivo:`, JSON.stringify(callParams, null, 2));
+        console.log(`📡 [Queue Worker] DISPATCHING (Positional):`);
+        console.log(`   - FROM: "${callFrom}" (type: ${typeof callFrom})`);
+        console.log(`   - TO:   "${callTo}" (type: ${typeof callTo})`);
+        console.log(`   - URL:  "${callUrl}" (type: ${typeof callUrl})`);
 
-        const response = await plivoClient.calls.create(callParams);
+        const response = await plivoClient.calls.create(
+            callFrom,
+            callTo,
+            callUrl,
+            {
+                answer_method: 'POST',
+                time_limit: 1200,
+                machine_detection: 'hangup'
+            }
+        );
 
         console.log(`✅ [Queue Worker] Call Initiated. SID: ${response.requestUuid || response.callUuid}`);
 
