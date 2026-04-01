@@ -55,7 +55,7 @@ async function processQueue() {
             return;
         }
 
-        console.log(`📥 [Queue Worker] Found ${queueItems.length} items to process.`);
+        console.log(`🕵️ [DEBUG] RAW DATA (First Item):`, JSON.stringify(queueItems[0].campaign?.organization, null, 2));
 
         // Parallel execution with atomic lock handling in executeCall
         await Promise.allSettled(queueItems.map(item => executeCall(item)));
