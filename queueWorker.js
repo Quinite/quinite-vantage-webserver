@@ -106,17 +106,19 @@ async function executeCall(item) {
         if (!formattedPhone || formattedPhone.length < 10) throw new Error("INVALID_DESTINATION_NUMBER");
         if (!WEBSOCKET_SERVER_URL || WEBSOCKET_SERVER_URL.includes('your-websocket-server')) throw new Error("INVALID_SERVER_CONFIG");
 
-        // [4] PLIVO INITIATION (Standard Positional Args + camelCase Options)
-        const response = await plivoClient.calls.create(
-            fromNumber,
-            formattedPhone,
-            answerUrl,
-            {
-                answerMethod: 'POST',
-                timeLimit: 1200,
-                machineDetection: 'hangup'
-            }
-        );
+        // [4] PLIVO INITIATION (v4 SDK requires a SINGLE object with snake_case parameters)
+        const callParams = {
+            from: fromNumber,
+            to: formattedPhone,
+            answer_url: answerUrl,
+            answer_method: 'POST',
+            time_limit: 1200,
+            machine_detection: 'hangup'
+        };
+
+        console.log(`📡 [Queue Worker] Dispatching to Plivo:`, JSON.stringify(callParams, null, 2));
+
+        const response = await plivoClient.calls.create(callParams);
 
         console.log(`✅ [Queue Worker] Call Initiated. SID: ${response.requestUuid || response.callUuid}`);
 
