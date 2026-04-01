@@ -131,8 +131,7 @@ async function executeCall(item) {
             answerUrl,
             {
                 answer_method: 'POST',
-                time_limit: 1800, // 30 mins max
-                machine_detection: 'hangup'
+                time_limit: 1800 // 30 mins max
             }
         );
 
