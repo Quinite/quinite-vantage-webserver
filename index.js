@@ -18,7 +18,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, perMessageDeflate: false });
+const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
 
 const PORT = parseInt(process.env.PORT) || 10000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -49,7 +49,7 @@ app.all('/answer', validatePlivoRequest, async (req, res) => {
 
     console.log(`📞 [${callUuid}] Incoming Answer | Lead: ${leadId} | Campaign: ${campaignId}`);
 
-    // [1] DIRECT CAMPAIGN & BILLING CHECK (v2 Revamp Plan: Cached Status)
+    // [1] DIRECT CAMPAIGN & BILLING CHECK
     const { data: campaignContext } = await supabase
         .from('campaigns')
         .select('status, organization:organizations!inner(subscription_status, call_credits(*))')
@@ -57,7 +57,6 @@ app.all('/answer', validatePlivoRequest, async (req, res) => {
         .single();
 
     const credits = campaignContext?.organization?.call_credits;
-    // Smart balance read: handles both object and array responses from Supabase
     const balance = Array.isArray(credits) ? parseFloat(credits[0]?.balance || 0) : parseFloat(credits?.balance || 0);
     const subStatus = campaignContext?.organization?.subscription_status || 'inactive';
     const campaignStatus = campaignContext?.status || 'inactive';
@@ -67,30 +66,20 @@ app.all('/answer', validatePlivoRequest, async (req, res) => {
         return res.set('Content-Type', 'text/xml').send(`<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>`);
     }
 
-    // Resolve WebSocket Base URL (Secure Only)
-    let wsBaseUrl = process.env.WEBSOCKET_SERVER_URL || process.env.WS_URL;
-    if (!wsBaseUrl) {
-        wsBaseUrl = `wss://${req.headers.host}`;
-    }
-
-    if (wsBaseUrl.startsWith('http://')) wsBaseUrl = wsBaseUrl.replace('http://', 'wss://');
-    else if (wsBaseUrl.startsWith('https://')) wsBaseUrl = wsBaseUrl.replace('https://', 'wss://');
-    else if (!wsBaseUrl.startsWith('ws')) wsBaseUrl = `wss://${wsBaseUrl}`;
-
-    const wsUrl = `${wsBaseUrl}/voice/stream?leadId=${leadId}&campaignId=${campaignId}&callSid=${callUuid}`;
+    // [2] BUILD WEBSOCKET URL from request host (same pattern as old working code)
+    const host = req.headers.host;
+    const wsUrl = `wss://${host}/voice/stream?leadId=${leadId}&campaignId=${campaignId}&callSid=${callUuid}`;
     const xmlWsUrl = wsUrl.replace(/&/g, '&amp;');
 
-    // Return Plivo Response XML
-    // ADDED: Immediate <Speak> to confirm audio path and reduce "silent start" anxiety
+    // [3] RETURN STREAM XML (no <Speak> — it blocks Plivo WebSocket connection)
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Speak voice="Woman">Hello?</Speak>
     <Stream bidirectional="true" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000">
         ${xmlWsUrl}
     </Stream>
 </Response>`;
 
-    console.log(`📤 [Answer] Sending XML to Plivo. Stream URL: ${wsUrl}`);
+    console.log(`📤 [Answer] Stream URL: ${wsUrl}`);
     res.set('Content-Type', 'text/xml').send(xml.trim());
 });
 
@@ -98,8 +87,20 @@ app.all('/answer', validatePlivoRequest, async (req, res) => {
    WEBSOCKET UPGRADE
 -------------------------------- */
 
-// WebSocket upgrade is handled automatically by wss attached to server
-console.log('✅ [WS] WebSocket server attached to HTTP server.');
+// WebSocket upgrade: manual handler (proven to work with Plivo on Railway)
+server.on('upgrade', (request, socket, head) => {
+    console.log(`\n🔄 [WS] Upgrade request: ${request.url}`);
+    console.log(`   Host: ${request.headers.host}`);
+    if (request.url.startsWith('/voice/stream')) {
+        wss.handleUpgrade(request, socket, head, (ws) => {
+            console.log('✅ [WS] Upgrade successful — emitting connection.');
+            wss.emit('connection', ws, request);
+        });
+    } else {
+        console.warn(`⚠️ [WS] Unknown path, destroying socket: ${request.url}`);
+        socket.destroy();
+    }
+});
 
 /* -------------------------------
    SESSION CACHE
