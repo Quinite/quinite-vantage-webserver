@@ -20,7 +20,7 @@ console.log("🚀 Starting Production-Grade Queue Worker...");
 async function processQueue() {
     try {
         const now = new Date().toISOString();
-        console.log(`📥 [Queue Worker] Heartbeat: Checking for pending calls at ${now}...`);
+        console.log(`📥 [v4-HARDEN] Heartbeat: Checking for pending calls at ${now}...`);
 
         // [1] ADVANCED POLLING: Priority + Status + Retry Logic
         const { data: queueItems, error } = await supabase
