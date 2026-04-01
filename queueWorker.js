@@ -91,22 +91,34 @@ async function executeCall(item) {
         if (!leadContext || !leadContext.phone) throw new Error("INVALID_LEAD");
         if (leadContext.project?.archived_at) throw new Error("PROJECT_ARCHIVED");
 
+        // [3] ANALYTICAL VALIDATION
         const fromNumber = getCallerId(campaign);
+        const rawPhone = leadContext.phone;
+        const formattedPhone = rawPhone.startsWith('+') ? rawPhone : `+${rawPhone.replace(/\D/g, '')}`;
         const answerUrl = `${WEBSOCKET_SERVER_URL}/answer?leadId=${lead_id}&campaignId=${campaign_id}`;
 
-        console.log(`📞 Dialing ${leadContext.name} (${lead_id})...`);
+        console.log(`\n📞 [Queue Worker] ATTEMPTING CALL:`);
+        console.log(`   📤 FROM: ${fromNumber}`);
+        console.log(`   📥 TO: ${formattedPhone} (${leadContext.name})`);
+        console.log(`   🔗 URL: ${answerUrl}`);
 
-        // [4] PLIVO INITIATION
+        if (!fromNumber || fromNumber === 'undefined') throw new Error("MISSING_FROM_NUMBER");
+        if (!formattedPhone || formattedPhone.length < 10) throw new Error("INVALID_DESTINATION_NUMBER");
+        if (!WEBSOCKET_SERVER_URL || WEBSOCKET_SERVER_URL.includes('your-websocket-server')) throw new Error("INVALID_SERVER_CONFIG");
+
+        // [4] PLIVO INITIATION (Standard Positional Args + camelCase Options)
         const response = await plivoClient.calls.create(
             fromNumber,
-            leadContext.phone,
+            formattedPhone,
             answerUrl,
             {
-                answer_method: 'POST',
-                time_limit: 1200, // 20 mins
-                machine_detection: 'hangup' // Prevent voicemail costs
+                answerMethod: 'POST',
+                timeLimit: 1200,
+                machineDetection: 'hangup'
             }
         );
+
+        console.log(`✅ [Queue Worker] Call Initiated. SID: ${response.requestUuid || response.callUuid}`);
 
         // [5] SUCCESS LOGGING
         await supabase.from('call_queue').update({ status: 'completed', updated_at: new Date() }).eq('id', id);
