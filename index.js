@@ -61,12 +61,21 @@ app.all('/answer', validatePlivoRequest, async (req, res) => {
         return res.set('Content-Type', 'text/xml').send(`<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>`);
     }
 
-    const protocol = req.headers['x-forwarded-proto'] === 'https' ? 'wss' : 'ws';
-    const host = req.headers.host;
-    const wsUrl = `${protocol}://${host}/voice/stream?leadId=${leadId}&campaignId=${campaignId}&callSid=${callUuid}`;
+    // Resolve WebSocket Base URL (Secure Only)
+    let wsBaseUrl = process.env.WEBSOCKET_SERVER_URL || process.env.WS_URL;
+    if (!wsBaseUrl) {
+        wsBaseUrl = `wss://${req.headers.host}`;
+    }
+
+    if (wsBaseUrl.startsWith('http://')) wsBaseUrl = wsBaseUrl.replace('http://', 'wss://');
+    else if (wsBaseUrl.startsWith('https://')) wsBaseUrl = wsBaseUrl.replace('https://', 'wss://');
+    else if (!wsBaseUrl.startsWith('ws')) wsBaseUrl = `wss://${wsBaseUrl}`;
+
+    const wsUrl = `${wsBaseUrl}/voice/stream?leadId=${leadId}&campaignId=${campaignId}&callSid=${callUuid}`;
     const xmlWsUrl = wsUrl.replace(/&/g, '&amp;');
 
-    // Added immediate <Speak> to reduce perceived latency and 'silent call' feedback
+    // Return Plivo Response XML
+    // ADDED: Immediate <Speak> to confirm audio path and reduce "silent start" anxiety
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Speak voice="Woman">Hello?</Speak>
