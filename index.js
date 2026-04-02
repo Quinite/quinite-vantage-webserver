@@ -131,11 +131,48 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
             }
         });
 
+        // [2] Optimized Single-Query Context Join
+        const { data: context, error: contextError } = await supabase
+            .from('leads')
+            .select(`
+                *,
+                project:projects(*)
+            `)
+            .eq('id', leadId)
+            .single();
+
+        // Fetch campaign independently (leads may not be linked to campaigns yet)
+        const { data: campaignData } = await supabase
+            .from('campaigns')
+            .select('*, organization:organizations!inner(id, subscription_status, call_credits(*))')
+            .eq('id', campaignId)
+            .single();
+
+        if (contextError || !context || !campaignData) {
+            console.error(`❌ [${callSid}] Handshake Failed:`, contextError?.message || 'Missing campaign');
+            return null;
+        }
+
+        const campaign = campaignData;
+        const project = context.project;
+        const organization = campaign.organization;
+        const credits = organization?.call_credits;
+        const balance = Array.isArray(credits) ? parseFloat(credits[0]?.balance || 0) : parseFloat(credits?.balance || 0);
+
+        // [3] Lifecycle & Billing Validation
+        if (!['active', 'running'].includes(campaign.status) || (project && project.archived_at)) {
+            console.warn(`🛑 [${callSid}] Campaign/Project Inactive (${campaign.status}).`);
+            return null;
+        }
+
+        if (!['active', 'trialing'].includes(organization.subscription_status) || balance < 0.5) {
+            console.warn(`💳 [${callSid}] Credits Exhausted/Sub Inactive (Sub: ${organization.subscription_status}, Bal: ${balance}).`);
+            return null;
+        }
+
         let conversationTranscript = '';
         let callLogId = null;
         let silenceTimer = null;
-        let context = null;
-        let campaign = null;
 
         const resetSilenceTimer = () => {
             if (silenceTimer) clearTimeout(silenceTimer);
@@ -145,95 +182,31 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
             }, 35000);
         };
 
-        // [2] Register Handlers IMMEDIATELY to avoid race conditions
+        // Handle OpenAI Readiness
         realtimeWS.on('open', async () => {
             console.log(`✅ [${callSid}] OpenAI Ready!`);
-            
-            try {
-                // Fetch context if not already done during reconnection/init
-                if (!context || !campaign) {
-                    const [leadRes, campRes] = await Promise.all([
-                        supabase.from('leads').select('*, project:projects(*)').eq('id', leadId).single(),
-                        supabase.from('campaigns').select('*, organization:organizations!inner(id, subscription_status, call_credits(*))').eq('id', campaignId).single()
-                    ]);
 
-                    if (leadRes.error || !leadRes.data || !campRes.data) {
-                        throw new Error(leadRes.error?.message || 'Context fallback failed');
-                    }
-                    context = leadRes.data;
-                    campaign = campRes.data;
-                }
+            await plivoWS.startPromise;
 
-                await plivoWS.startPromise;
+            // Handshake context update
+            const initialSession = createSessionUpdate({ ...context, campaign }, campaign, [], []);
+            realtimeWS.send(JSON.stringify(initialSession));
+            realtimeWS.send(JSON.stringify({ type: 'response.create' }));
 
-                // Handshake context update
-                const initialSession = createSessionUpdate({ ...context, campaign }, campaign, [], []);
-                realtimeWS.send(JSON.stringify(initialSession));
-                realtimeWS.send(JSON.stringify({ type: 'response.create' }));
-                console.log(`📤 [${callSid}] Session Update Sent & Greeting Triggered.`);
+            // Async Context Warming
+            fetchFullContext(realtimeWS, context, campaign, callSid);
 
-                // Async Context Warming
-                fetchFullContext(realtimeWS, context, campaign, callSid);
-
-                // Log Session Start
-                callLogId = await logCallStart(context, campaign, callSid);
-                resetSilenceTimer();
-            } catch (err) {
-                console.error(`❌ [${callSid}] Initialization error:`, err.message);
-                plivoWS.close();
-            }
+            // Log Session Start
+            callLogId = await logCallStart(context, campaign, callSid);
+            resetSilenceTimer();
         });
 
-        realtimeWS.on('error', (err) => {
-            console.error(`❌ [${callSid}] OpenAI WebSocket Error:`, err.message);
-        });
-
-        realtimeWS.on('close', (code, reason) => {
-            console.log(`🔌 [${callSid}] OpenAI Connection Closed: ${code} - ${reason}`);
-        });
-
-        // [3] Optimized Context Fetching (Concurrent with connection)
-        const [leadRes, campRes] = await Promise.all([
-            supabase.from('leads').select('*, project:projects(*)').eq('id', leadId).single(),
-            supabase.from('campaigns').select('*, organization:organizations!inner(id, subscription_status, call_credits(*))').eq('id', campaignId).single()
-        ]);
-
-        if (leadRes.error || !leadRes.data || !campRes.data) {
-            console.error(`❌ [${callSid}] Handshake Failed:`, leadRes.error?.message || 'Missing campaign');
-            realtimeWS.close();
-            return null;
-        }
-
-        context = leadRes.data;
-        campaign = campRes.data;
-
-        // Lifecycle & Billing Validation
-        const organization = campaign.organization;
-        const credits = organization?.call_credits;
-        const balance = Array.isArray(credits) ? parseFloat(credits[0]?.balance || 0) : parseFloat(credits?.balance || 0);
-
-        if (!['active', 'running'].includes(campaign.status) || (context.project && context.project.archived_at)) {
-            console.warn(`🛑 [${callSid}] Campaign/Project Inactive (${campaign.status}).`);
-            realtimeWS.close();
-            return null;
-        }
-
-        if (!['active', 'trialing'].includes(organization.subscription_status) || balance < 0.5) {
-            console.warn(`💳 [${callSid}] Credits Exhausted (Sub: ${organization.subscription_status}, Bal: ${balance}).`);
-            realtimeWS.close();
-            return null;
-        }
-
-        // Check if socket already opened during database fetch
-        if (realtimeWS.readyState === WebSocket.OPEN) {
-            realtimeWS.emit('open'); 
-        }
-
-        // [4] Tool Execution & Message Handling
+        // Tool Execution Management
         const handleToolCall = async (response) => {
             const { name, arguments: argsJson, call_id } = response;
             const args = JSON.parse(argsJson);
 
+            // Post-Handshake Credit Pulse Check
             const { data: creditPulse } = await supabase.from('call_credits').select('balance').eq('organization_id', organization.id).single();
             if (!creditPulse || creditPulse.balance < 0.1) {
                 return { success: false, error: 'Balance depleted.' };
@@ -278,10 +251,6 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
                 resetSilenceTimer();
 
                 switch (response.type) {
-                    case 'error':
-                        console.error(`❌ [${callSid}] OpenAI API Error:`, response.error);
-                        break;
-
                     case 'response.function_call_arguments.done':
                         await handleToolCall(response);
                         break;
@@ -303,14 +272,12 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
                         }
                         break;
 
-                    case 'response.audio_transcript.done':
-                        console.log(`🤖 AI: ${response.transcript}`);
-                        conversationTranscript += `AI: ${response.transcript}\n`;
+                    case 'conversation.item.input_audio_transcription.completed':
+                        conversationTranscript += `User: ${response.transcript}\n`;
                         break;
 
-                    case 'conversation.item.input_audio_transcription.completed':
-                        console.log(`👤 User: ${response.transcript}`);
-                        conversationTranscript += `User: ${response.transcript}\n`;
+                    case 'response.audio_transcript.done':
+                        conversationTranscript += `AI: ${response.transcript}\n`;
                         break;
                 }
             } catch (err) {
