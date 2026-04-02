@@ -22,8 +22,15 @@ const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
 
 const PORT = parseInt(process.env.PORT) || 10000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime';
+const OPENAI_REALTIME_URL = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`;
 const STREAM_START_TIMEOUT_MS = 15000;
 const REALTIME_START_TIMEOUT_MS = 20000;
+const CALL_SILENCE_TIMEOUT_MS = 35000;
+
+if (!OPENAI_API_KEY) {
+    console.error('❌ Missing OPENAI_API_KEY. Realtime voice calls will fail.');
+}
 
 // Security Middleware: Plivo Signature Validation Placeholder
 const validatePlivoRequest = (req, res, next) => {
@@ -117,6 +124,23 @@ function setCachedContext(id, data) {
     contextCache.set(id, { data, timestamp: Date.now() });
 }
 
+function normalizeCloseReason(reason) {
+    if (!reason) return 'no reason provided';
+    if (Buffer.isBuffer(reason)) return reason.toString('utf8');
+    return String(reason);
+}
+
+function formatRealtimeError(event) {
+    const error = event?.error || {};
+    return error.message || error.code || error.type || 'Unknown realtime error';
+}
+
+function sendRealtimeEvent(realtimeWS, payload) {
+    if (realtimeWS.readyState === WebSocket.OPEN) {
+        realtimeWS.send(JSON.stringify(payload));
+    }
+}
+
 /* -------------------------------
    AI ENGINE: OpenAI Realtime
 -------------------------------- */
@@ -128,11 +152,69 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
         let sessionReady = false;
         let finalizingSetupFailure = false;
         // [1] Pre-emptive OpenAI Connection
-        const realtimeWS = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview', {
+        const realtimeWS = new WebSocket(OPENAI_REALTIME_URL, {
             headers: {
-                'Authorization': `Bearer ${OPENAI_API_KEY}`,
-                'OpenAI-Beta': 'realtime=v1'
+                Authorization: `Bearer ${OPENAI_API_KEY}`
             }
+        });
+        const realtimeReadyPromise = new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error(`OPENAI_REALTIME_READY_TIMEOUT:${REALTIME_START_TIMEOUT_MS}`)), REALTIME_START_TIMEOUT_MS);
+            let settled = false;
+
+            const finish = (fn, value) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                fn(value);
+            };
+
+            realtimeWS.on('open', () => {
+                console.log(`✅ [${callSid}] OpenAI realtime socket connected (${OPENAI_REALTIME_MODEL}).`);
+            });
+
+            realtimeWS.on('error', (err) => {
+                console.error(`❌ [${callSid}] OpenAI socket error:`, err.message);
+                if (!sessionReady && !finalizingSetupFailure) {
+                    finish(reject, new Error(`OPENAI_SOCKET_ERROR:${err.message}`));
+                }
+            });
+
+            realtimeWS.on('close', (code, reason) => {
+                const details = `${code} ${normalizeCloseReason(reason)}`.trim();
+                console.warn(`⚠️ [${callSid}] OpenAI socket closed: ${details}`);
+                if (!sessionReady && !finalizingSetupFailure) {
+                    finish(reject, new Error(`OPENAI_SOCKET_CLOSED:${details}`));
+                }
+            });
+
+            realtimeWS.on('message', (message) => {
+                try {
+                    const event = JSON.parse(message);
+
+                    if (event.type === 'session.created') {
+                        console.log(`✅ [${callSid}] Realtime session created.`);
+                        finish(resolve, event);
+                        return;
+                    }
+
+                    if (event.type === 'session.updated') {
+                        console.log(`ℹ️ [${callSid}] Realtime session updated.`);
+                        return;
+                    }
+
+                    if (event.type === 'error') {
+                        const errorMessage = formatRealtimeError(event);
+                        console.error(`❌ [${callSid}] OpenAI server error: ${errorMessage}`);
+                        if (!sessionReady && !finalizingSetupFailure) {
+                            finish(reject, new Error(`OPENAI_SERVER_ERROR:${errorMessage}`));
+                        }
+                    }
+                } catch (err) {
+                    if (!sessionReady && !finalizingSetupFailure) {
+                        console.error(`❌ [${callSid}] Failed to parse early realtime event:`, err.message);
+                    }
+                }
+            });
         });
 
         // [2] Optimized Single-Query Context Join
@@ -146,13 +228,13 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
             .single();
 
         // Fetch campaign independently (leads may not be linked to campaigns yet)
-        const { data: campaignData } = await supabase
+        const { data: campaignData, error: campaignError } = await supabase
             .from('campaigns')
-            .select('*, organization:organizations!inner(id, subscription_status, call_credits(*))')
+            .select('*, organization:organizations!inner(id, name, subscription_status, call_credits(*))')
             .eq('id', campaignId)
             .single();
 
-        if (contextError || !context || !campaignData) {
+        if (contextError || campaignError || !context || !campaignData) {
             console.error(`❌ [${callSid}] Handshake Failed:`, contextError?.message || 'Missing campaign');
             return null;
         }
@@ -177,6 +259,7 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
         let conversationTranscript = '';
         let callLogId = null;
         let silenceTimer = null;
+        const handledToolCalls = new Set();
         const realtimeStartTimer = setTimeout(async () => {
             if (sessionReady || finalizingSetupFailure) return;
             finalizingSetupFailure = true;
@@ -189,9 +272,9 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
         const resetSilenceTimer = () => {
             if (silenceTimer) clearTimeout(silenceTimer);
             silenceTimer = setTimeout(async () => {
-                console.log(`🔇 [${callSid}] Silence Timeout (35s).`);
+                console.log(`🔇 [${callSid}] Silence timeout.`);
                 await handleDisconnect(plivoWS, realtimeWS, callSid, leadId, { reason: 'silence_timeout' }, callLogId);
-            }, 35000);
+            }, CALL_SILENCE_TIMEOUT_MS);
         };
 
         // Handle OpenAI Readiness
@@ -221,7 +304,7 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
                 if (finalizingSetupFailure) return;
                 finalizingSetupFailure = true;
                 clearTimeout(realtimeStartTimer);
-                console.error(`âŒ [${callSid}] Session bootstrap failed:`, err.message);
+                console.error(`❌ [${callSid}] Session bootstrap failed:`, err.message);
                 try { await plivoClient.calls.hangup(callSid); } catch (hangupErr) { }
                 try { plivoWS.close(); } catch (closeErr) { }
                 try { realtimeWS.close(); } catch (closeErr) { }
@@ -231,12 +314,20 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
         // Tool Execution Management
         const handleToolCall = async (response) => {
             const { name, arguments: argsJson, call_id } = response;
-            const args = JSON.parse(argsJson);
+            const args = typeof argsJson === 'string' ? JSON.parse(argsJson || '{}') : (argsJson || {});
+
+            if (call_id && handledToolCalls.has(call_id)) return;
+            if (call_id) handledToolCalls.add(call_id);
 
             // Post-Handshake Credit Pulse Check
             const { data: creditPulse } = await supabase.from('call_credits').select('balance').eq('organization_id', organization.id).single();
             if (!creditPulse || creditPulse.balance < 0.1) {
-                return { success: false, error: 'Balance depleted.' };
+                sendRealtimeEvent(realtimeWS, {
+                    type: 'conversation.item.create',
+                    item: { type: 'function_call_output', call_id, output: JSON.stringify({ success: false, error: 'Balance depleted.' }) }
+                });
+                sendRealtimeEvent(realtimeWS, { type: 'response.create' });
+                return;
             }
 
             let result = { success: false };
@@ -265,30 +356,34 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
                 result = { success: false, error: err.message };
             }
 
-            realtimeWS.send(JSON.stringify({
-                type: "conversation.item.create",
-                item: { type: "function_call_output", call_id, output: JSON.stringify(result) }
-            }));
-            realtimeWS.send(JSON.stringify({ type: 'response.create' }));
+            sendRealtimeEvent(realtimeWS, {
+                type: 'conversation.item.create',
+                item: { type: 'function_call_output', call_id, output: JSON.stringify(result) }
+            });
+            sendRealtimeEvent(realtimeWS, { type: 'response.create' });
         };
 
         realtimeWS.on('message', async (message) => {
             try {
                 const response = JSON.parse(message);
+
+                if (response.type === 'error') {
+                    console.error(`❌ [${callSid}] OpenAI server error: ${formatRealtimeError(response)}`);
+                    return;
+                }
+
+                if (!sessionReady) return;
                 resetSilenceTimer();
 
                 switch (response.type) {
-                    case 'response.function_call_arguments.done':
-                        await handleToolCall(response);
-                        break;
-
                     case 'input_audio_buffer.speech_started':
                         if (plivoWS.readyState === WebSocket.OPEN) {
                             plivoWS.send(JSON.stringify({ event: 'clearAudio' }));
                         }
-                        realtimeWS.send(JSON.stringify({ type: 'response.cancel' }));
+                        sendRealtimeEvent(realtimeWS, { type: 'response.cancel' });
                         break;
 
+                    case 'response.output_audio.delta':
                     case 'response.audio.delta':
                         if (plivoWS.readyState === WebSocket.OPEN) {
                             plivoWS.send(JSON.stringify({
@@ -300,17 +395,65 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
                         break;
 
                     case 'conversation.item.input_audio_transcription.completed':
-                        conversationTranscript += `User: ${response.transcript}\n`;
+                        if (response.transcript) {
+                            conversationTranscript += `User: ${response.transcript}\n`;
+                        }
                         break;
 
+                    case 'response.output_audio_transcript.done':
                     case 'response.audio_transcript.done':
-                        conversationTranscript += `AI: ${response.transcript}\n`;
+                        if (response.transcript) {
+                            conversationTranscript += `AI: ${response.transcript}\n`;
+                        }
+                        break;
+
+                    case 'response.done':
+                        for (const item of (response.response?.output || [])) {
+                            if (item.type === 'function_call') {
+                                await handleToolCall(item);
+                            }
+                        }
+                        break;
+
+                    case 'response.function_call_arguments.done':
+                        await handleToolCall(response);
                         break;
                 }
             } catch (err) {
                 console.error(`❌ [${callSid}] Message handler error:`, err.message);
             }
         });
+
+        realtimeWS.removeAllListeners('open');
+
+        try {
+            await realtimeReadyPromise;
+
+            const streamStarted = await plivoWS.startPromise;
+            if (!streamStarted || !plivoWS.streamId) {
+                throw new Error('PLIVO_STREAM_NOT_READY');
+            }
+
+            sendRealtimeEvent(realtimeWS, createSessionUpdate({ ...context, campaign }, campaign, []));
+            sessionReady = true;
+            clearTimeout(realtimeStartTimer);
+            resetSilenceTimer();
+            sendRealtimeEvent(realtimeWS, { type: 'response.create' });
+
+            callLogId = await logCallStart(context, campaign, callSid);
+
+            fetchFullContext(realtimeWS, context, campaign, callSid);
+        } catch (err) {
+            if (finalizingSetupFailure) return null;
+            finalizingSetupFailure = true;
+            clearTimeout(realtimeStartTimer);
+            console.error(`❌ [${callSid}] Session bootstrap failed:`, err.message);
+            try { await plivoClient.calls.hangup(callSid); } catch (hangupErr) { }
+            try { plivoWS.close(); } catch (closeErr) { }
+            try { realtimeWS.close(); } catch (closeErr) { }
+            try { realtimeWS.close(); } catch (err) { }
+            return null;
+        }
 
         const cleanup = async () => {
             clearTimeout(realtimeStartTimer);
@@ -322,7 +465,7 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
         };
 
         realtimeWS.on('error', async (err) => {
-            console.error(`âŒ [${callSid}] Realtime socket error:`, err.message);
+            console.error(`❌ [${callSid}] Realtime socket error:`, err.message);
             if (sessionReady || finalizingSetupFailure) return;
             finalizingSetupFailure = true;
             clearTimeout(realtimeStartTimer);
@@ -334,7 +477,7 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
             if (!sessionReady && !finalizingSetupFailure) {
                 finalizingSetupFailure = true;
                 clearTimeout(realtimeStartTimer);
-                console.error(`âŒ [${callSid}] Realtime socket closed before session became ready.`);
+                console.error(`❌ [${callSid}] Realtime socket closed before session became ready.`);
                 try { await plivoClient.calls.hangup(callSid); } catch (hangupErr) { }
                 try { plivoWS.close(); } catch (closeErr) { }
             }
@@ -367,7 +510,7 @@ async function fetchFullContext(realtimeWS, lead, campaign, callSid) {
             setCachedContext(cacheKey, projects);
         }
 
-        const fullSession = createSessionUpdate(lead, campaign, projects, []);
+        const fullSession = createSessionUpdate(lead, campaign, projects);
         if (realtimeWS.readyState === WebSocket.OPEN) realtimeWS.send(JSON.stringify(fullSession));
     } catch (err) { }
 }

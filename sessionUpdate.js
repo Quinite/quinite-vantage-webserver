@@ -1,140 +1,174 @@
-export const createSessionUpdate = (context, campaign, otherProjects = []) => {
-    // ⚡ PRE-COMPUTE CONTEXT
+const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime';
+const REALTIME_VOICE = process.env.OPENAI_REALTIME_VOICE || 'marin';
+const TRANSCRIPTION_MODEL = process.env.OPENAI_TRANSCRIPTION_MODEL || 'gpt-4o-mini-transcribe';
+
+function buildProjectsText(otherProjects) {
+    if (!otherProjects.length) return 'Focus on the current project only unless the lead asks for alternatives.';
+
+    return otherProjects
+        .slice(0, 3)
+        .map((project) => `- ${project.name}: ${project.location || 'Location unavailable'}`)
+        .join('\n');
+}
+
+function buildInstructions(context, campaign, otherProjects) {
     const lead = context;
     const project = lead.project || {};
-    
-    const projectsText = otherProjects.length > 0
-        ? otherProjects.slice(0, 3).map(p => `- ${p.name}: ${p.location}`).join('\n')
-        : 'Contact Support for other projects.';
+    const firstName = lead.name?.split(' ')?.[0] || 'Sir';
 
-    const systemInstructions = `
-# IDENTITY: Riya (Female), Senior Sales Consultant at ${campaign?.organization?.name || 'Quinite'}.
-# VOICE: Vibrant, professional, culturally aware. High-energy closer.
-# LANGUAGE: Hinglish (Professional conversational mix).
-# CRITICAL: Use FEMALE grammar (Ending in 'Rahi hoon', 'Deti hoon', 'Karungi'). NEVER use male endings like 'Karta hoon'.
+    return `
+You are Riya, a female senior real-estate sales consultant for ${campaign?.organization?.name || 'Quinite'}.
+Speak in concise professional Hinglish, always using feminine grammar.
+Keep replies short, natural, and phone-friendly. Avoid long monologues.
 
-# PRIMARY OBJECTIVE: 🎯 QUALIFY & SELL THE VISIT. 
-- Build urgency: "Sir, inventory bhot fast move ho rahi hai, last few units bachi hain."
-- Trust Factor: "Ye project ka location premium hai, future ROI bhot solid rahega."
+Primary goal:
+- qualify the lead
+- answer project questions accurately
+- move the lead toward a site visit or callback
 
-# TECHNICAL PROPERTY PARAMETERS:
-1. **Property Category**:
-   - **Residential**: Apartments, Villas, Penthouses.
-   - **Commercial**: Shops, Showrooms, Offices.
-   - **Land**: Residential or Commercial Plots.
-2. **Architecture & Choice**:
-   - **Vastu Compliance**: East-facing, South-West entry etc. (Critical for most Indian families).
-   - **Corner Units**: Offer better ventilation/privacy (Sell as a premium option).
-   - **Facing**: Direction of the balcony/entry (East/North/etc).
-   - **Config Names**: 1BHK, 1.5BHK, 2BHK, 3.5BHK, 4BHK (Derive from unit_configs).
-   - **Transaction**: Buying (Sell), Renting, or Leasing (Lease).
-3. **Project Stats**:
-   - **Status**: ${project.construction_status || 'Under development'}.
-   - **Possession**: ${project.possession_date || 'check with senior'}.
+Lead:
+- name: ${lead.name || 'Unknown'}
+- phone: ${lead.phone || 'Unknown'}
 
-# SALES GUIDELINES:
-1. **The Hook**: "Hello ${lead.name?.split(' ')[0] || 'Sir'}? Riya bol rahi hoon... aapne recently hamari property enquiries check kari thi?"
-2. **The Qualify**: Ask for Type (Home/Office/Plot), BHK preferred (1BHK/2BHK), Budget, and Vastu needs.
-3. **The Pivot**: 
-   - Vastu? "Ji, East-facing entry wali limited units available hain."
-   - Floor? "Lower floors convenience ke liye best hain, par higher floors se view bhot shandar milega."
-4. **The Close**: "Aap kal physical visit kar lo, main ek pre-booking slot arrange karwa deti hoon... kis time aaoge?"
+Current project:
+- name: ${project.name || 'Current project'}
+- location: ${project.location || 'Location unavailable'}
+- status: ${project.construction_status || 'Under development'}
+- possession: ${project.possession_date || 'Check with senior'}
 
-# STRICT RULES:
-- **TOOL USAGE**: Use 'check_detailed_inventory' with ALL parameters (vastu, corner, facing) if the lead specifies them.
-- **DATA CAPTURE**: Use 'log_intent' mid-call to save lead specifications (BHK, Vastu, Budget).
-- **BREVITY**: Keep responses under 20 words for natural flow. Use fillers like "Ji", "Bilkul", "I understand".
+Conversation approach:
+- Start with: "Hello ${firstName}, Riya bol rahi hoon. Aapne recently property enquiry ki thi?"
+- Confirm interest before pitching.
+- Ask only one or two questions at a time.
+- Capture budget, unit preference, transaction type, vastu/facing, and callback timing when relevant.
+- If the lead sounds busy, offer a callback quickly.
+- If the lead asks for inventory specifics, use the available tools instead of guessing.
 
-# OTHER PROJECTS:
-${projectsText}
+Tool rules:
+- Use check_detailed_inventory for specific inventory requests.
+- Use log_intent once meaningful preferences are known.
+- Use schedule_callback if the lead is busy.
+- Use disconnect_call only for wrong number, explicit refusal, abuse, or prolonged silence.
+- Use transfer_call only when the lead is highly interested or asks for a human closer.
 
-# CAMPAIGN SCRIPT: 
-${campaign.ai_script || 'Focus on site visit conversion.'}
-`.trim();
+Other active projects:
+${buildProjectsText(otherProjects)}
+
+Campaign guidance:
+${campaign.ai_script || 'Focus on helpful qualification and site visit conversion.'}
+    `.trim();
+}
+
+export const createSessionUpdate = (context, campaign, otherProjects = []) => {
+    const instructions = buildInstructions(context, campaign, otherProjects);
 
     return {
-        type: "session.update",
+        type: 'session.update',
         session: {
-            turn_detection: { type: "server_vad", threshold: 0.5, prefix_padding_ms: 300, silence_duration_ms: 600 },
-            input_audio_format: "g711_ulaw",
-            output_audio_format: "g711_ulaw",
-            modalities: ["text", "audio"],
-            temperature: 0.75,
-            input_audio_transcription: { model: "whisper-1", language: "hi" },
-            instructions: systemInstructions,
-            voice: "shimmer",
+            type: 'realtime',
+            model: REALTIME_MODEL,
+            output_modalities: ['audio'],
+            audio: {
+                input: {
+                    format: {
+                        type: 'audio/pcmu'
+                    },
+                    turn_detection: {
+                        type: 'semantic_vad',
+                        create_response: true,
+                        interrupt_response: true
+                    },
+                    transcription: {
+                        model: TRANSCRIPTION_MODEL,
+                        language: 'hi'
+                    }
+                },
+                output: {
+                    format: {
+                        type: 'audio/pcmu'
+                    },
+                    voice: REALTIME_VOICE
+                }
+            },
+            instructions,
             tools: [
                 {
-                    type: "function",
-                    name: "transfer_call",
-                    description: "Escalate to a Senior Manager for deep negotiation or booking confirmations.",
+                    type: 'function',
+                    name: 'transfer_call',
+                    description: 'Escalate to a senior human agent for high-intent or negotiation-ready leads.',
                     parameters: {
-                        type: "object",
-                        properties: { reason: { type: "string" } },
-                        required: ["reason"]
+                        type: 'object',
+                        properties: {
+                            reason: { type: 'string' }
+                        },
+                        required: ['reason']
                     }
                 },
                 {
-                    type: "function",
-                    name: "check_detailed_inventory",
-                    description: "Advanced search for units using all REVAMP criteria: category, transaction, configuration (1BHK/2BHK), vastu, corner, or facing.",
+                    type: 'function',
+                    name: 'check_detailed_inventory',
+                    description: 'Search available units using category, transaction, BHK/config, price, vastu, facing, corner, and floor preferences.',
                     parameters: {
-                        type: "object",
-                        properties: { 
-                            category: { type: "string", enum: ["residential", "commercial", "land"] },
-                            transaction_type: { type: "string", enum: ["sell", "rent", "lease"] },
-                            property_type: { type: "string", description: "e.g. apartment, villa, office" },
-                            config_name: { type: "string", description: "e.g. 1BHK, 2.5BHK, 4BHK" },
-                            bedrooms: { type: "number" },
-                            price_min: { type: "number" },
-                            price_max: { type: "number" },
-                            min_carpet_area: { type: "number" },
-                            is_vastu_compliant: { type: "boolean" },
-                            is_corner: { type: "boolean" },
-                            facing: { type: "string", description: "Direction like East, North-East etc." },
-                            floor_min: { type: "number" },
-                            floor_max: { type: "number" }
+                        type: 'object',
+                        properties: {
+                            category: { type: 'string', enum: ['residential', 'commercial', 'land'] },
+                            transaction_type: { type: 'string', enum: ['sell', 'rent', 'lease'] },
+                            property_type: { type: 'string', description: 'For example apartment, villa, office, shop.' },
+                            config_name: { type: 'string', description: 'For example 1BHK, 2BHK, 3.5BHK.' },
+                            bedrooms: { type: 'number' },
+                            price_min: { type: 'number' },
+                            price_max: { type: 'number' },
+                            min_carpet_area: { type: 'number' },
+                            is_vastu_compliant: { type: 'boolean' },
+                            is_corner: { type: 'boolean' },
+                            facing: { type: 'string' },
+                            floor_min: { type: 'number' },
+                            floor_max: { type: 'number' }
                         }
                     }
                 },
                 {
-                    type: "function",
-                    name: "log_intent",
-                    description: "CRITICAL: Capture lead specifics in CRM during call: BHK, Vastu, Facing, and Budget.",
+                    type: 'function',
+                    name: 'log_intent',
+                    description: 'Persist the lead preferences and buying intent captured during the call.',
                     parameters: {
-                        type: "object",
-                        properties: { 
-                            interest_level: { type: "string", enum: ["high", "medium", "low"] },
-                            config_preference: { type: "string", description: "e.g. 2BHK, 3BHK" },
-                            is_vastu_required: { type: "boolean" },
-                            preferred_facing: { type: "string" },
-                            category: { type: "string", enum: ["residential", "commercial", "land"] },
-                            transaction_type: { type: "string", enum: ["sell", "rent", "lease"] },
-                            budget_min: { type: "number" },
-                            budget_max: { type: "number" },
-                            pain_points: { type: "array", items: { type: "string" } }
+                        type: 'object',
+                        properties: {
+                            interest_level: { type: 'string', enum: ['high', 'medium', 'low'] },
+                            config_preference: { type: 'string' },
+                            is_vastu_required: { type: 'boolean' },
+                            preferred_facing: { type: 'string' },
+                            category: { type: 'string', enum: ['residential', 'commercial', 'land'] },
+                            transaction_type: { type: 'string', enum: ['sell', 'rent', 'lease'] },
+                            budget_min: { type: 'number' },
+                            budget_max: { type: 'number' },
+                            pain_points: { type: 'array', items: { type: 'string' } }
                         },
-                        required: ["interest_level"]
+                        required: ['interest_level']
                     }
                 },
                 {
-                    type: "function",
-                    name: "disconnect_call",
-                    description: "End the call if user is Abusive or clearly Not Interested.",
+                    type: 'function',
+                    name: 'disconnect_call',
+                    description: 'End the call when the lead is not interested, it is a wrong number, or the call is silent.',
                     parameters: {
-                        type: "object",
-                        properties: { reason: { type: "string", enum: ["not_interested", "wrong_number", "completed", "silence"] } },
-                        required: ["reason"]
+                        type: 'object',
+                        properties: {
+                            reason: { type: 'string', enum: ['not_interested', 'wrong_number', 'completed', 'silence'] }
+                        },
+                        required: ['reason']
                     }
                 },
                 {
-                    type: "function",
-                    name: "schedule_callback",
-                    description: "Set a time to call back if lead is busy.",
+                    type: 'function',
+                    name: 'schedule_callback',
+                    description: 'Store a callback time when the lead asks to speak later.',
                     parameters: {
-                        type: "object",
-                        properties: { time: { type: "string" } },
-                        required: ["time"]
+                        type: 'object',
+                        properties: {
+                            time: { type: 'string' }
+                        },
+                        required: ['time']
                     }
                 }
             ]
