@@ -22,8 +22,6 @@ const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
 
 const PORT = parseInt(process.env.PORT) || 10000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const STREAM_START_TIMEOUT_MS = 15000;
-const REALTIME_START_TIMEOUT_MS = 20000;
 
 // Security Middleware: Plivo Signature Validation Placeholder
 const validatePlivoRequest = (req, res, next) => {
@@ -125,8 +123,6 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
     console.log(`\n🎯 [${callSid}] INITIALIZING SEARCH-READY SESSION...`);
 
     try {
-        let sessionReady = false;
-        let finalizingSetupFailure = false;
         // [1] Pre-emptive OpenAI Connection
         const realtimeWS = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview', {
             headers: {
@@ -177,14 +173,6 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
         let conversationTranscript = '';
         let callLogId = null;
         let silenceTimer = null;
-        const realtimeStartTimer = setTimeout(async () => {
-            if (sessionReady || finalizingSetupFailure) return;
-            finalizingSetupFailure = true;
-            console.error(`âŒ [${callSid}] Realtime session did not become ready within ${REALTIME_START_TIMEOUT_MS}ms.`);
-            try { await plivoClient.calls.hangup(callSid); } catch (err) { }
-            try { plivoWS.close(); } catch (err) { }
-            try { realtimeWS.close(); } catch (err) { }
-        }, REALTIME_START_TIMEOUT_MS);
 
         const resetSilenceTimer = () => {
             if (silenceTimer) clearTimeout(silenceTimer);
@@ -198,34 +186,19 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
         realtimeWS.on('open', async () => {
             console.log(`✅ [${callSid}] OpenAI Ready!`);
 
-            try {
-                const streamStarted = await plivoWS.startPromise;
-                if (!streamStarted || !plivoWS.streamId) {
-                    throw new Error('PLIVO_STREAM_NOT_READY');
-                }
+            await plivoWS.startPromise;
 
-                // Handshake context update
-                const initialSession = createSessionUpdate({ ...context, campaign }, campaign, [], []);
-                realtimeWS.send(JSON.stringify(initialSession));
-                realtimeWS.send(JSON.stringify({ type: 'response.create' }));
+            // Handshake context update
+            const initialSession = createSessionUpdate({ ...context, campaign }, campaign, [], []);
+            realtimeWS.send(JSON.stringify(initialSession));
+            realtimeWS.send(JSON.stringify({ type: 'response.create' }));
 
-                // Async Context Warming
-                fetchFullContext(realtimeWS, context, campaign, callSid);
+            // Async Context Warming
+            fetchFullContext(realtimeWS, context, campaign, callSid);
 
-                // Log Session Start
-                callLogId = await logCallStart(context, campaign, callSid);
-                sessionReady = true;
-                clearTimeout(realtimeStartTimer);
-                resetSilenceTimer();
-            } catch (err) {
-                if (finalizingSetupFailure) return;
-                finalizingSetupFailure = true;
-                clearTimeout(realtimeStartTimer);
-                console.error(`âŒ [${callSid}] Session bootstrap failed:`, err.message);
-                try { await plivoClient.calls.hangup(callSid); } catch (hangupErr) { }
-                try { plivoWS.close(); } catch (closeErr) { }
-                try { realtimeWS.close(); } catch (closeErr) { }
-            }
+            // Log Session Start
+            callLogId = await logCallStart(context, campaign, callSid);
+            resetSilenceTimer();
         });
 
         // Tool Execution Management
@@ -313,32 +286,12 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
         });
 
         const cleanup = async () => {
-            clearTimeout(realtimeStartTimer);
             if (silenceTimer) clearTimeout(silenceTimer);
             if (realtimeWS.readyState === WebSocket.OPEN) realtimeWS.close();
             if (callLogId) {
                 await finalizeCallOutcome(callLogId, leadId, campaignId, conversationTranscript, callSid);
             }
         };
-
-        realtimeWS.on('error', async (err) => {
-            console.error(`âŒ [${callSid}] Realtime socket error:`, err.message);
-            if (sessionReady || finalizingSetupFailure) return;
-            finalizingSetupFailure = true;
-            clearTimeout(realtimeStartTimer);
-            try { await plivoClient.calls.hangup(callSid); } catch (hangupErr) { }
-            try { plivoWS.close(); } catch (closeErr) { }
-        });
-
-        realtimeWS.on('close', async () => {
-            if (!sessionReady && !finalizingSetupFailure) {
-                finalizingSetupFailure = true;
-                clearTimeout(realtimeStartTimer);
-                console.error(`âŒ [${callSid}] Realtime socket closed before session became ready.`);
-                try { await plivoClient.calls.hangup(callSid); } catch (hangupErr) { }
-                try { plivoWS.close(); } catch (closeErr) { }
-            }
-        });
 
         plivoWS.on('close', cleanup);
         realtimeWS.on('close', cleanup);
@@ -557,8 +510,9 @@ wss.on('connection', async (plivoWS, request) => {
     const callSid = url.searchParams.get('callSid');
 
     plivoWS.startPromise = new Promise((resolve) => {
-        plivoWS.resolveStart = () => resolve(true);
-        plivoWS.startTimeout = setTimeout(() => resolve(false), STREAM_START_TIMEOUT_MS);
+        plivoWS.resolveStart = resolve;
+        // 5s Safety Timeout for Plivo Start Event
+        setTimeout(() => resolve(), 5000);
     });
 
     plivoWS.on('message', (message) => {
@@ -568,7 +522,6 @@ wss.on('connection', async (plivoWS, request) => {
                 plivoWS.realtime.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: data.media.payload }));
             } else if (data.event === 'start') {
                 plivoWS.streamId = data.start.streamId;
-                if (plivoWS.startTimeout) clearTimeout(plivoWS.startTimeout);
                 if (plivoWS.resolveStart) plivoWS.resolveStart();
             }
         } catch (err) {

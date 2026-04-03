@@ -4,9 +4,10 @@ import dotenv from 'dotenv';
 import { dirname } from 'path';
 import { fileURLToPath } from 'url';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-dotenv.config({ path: `${__dirname}/.env` });
+dotenv.config();
 
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const WEBSOCKET_SERVER_URL = process.env.WEBSOCKET_SERVER_URL;
 const POLL_INTERVAL_MS = 4000;
 const MAX_CONCURRENT_CALLS = 10; 
 const RETRY_DELAY_MINUTES = 20;
@@ -109,12 +110,11 @@ async function executeCall(item) {
         if (leadContext.project?.archived_at) throw new Error("PROJECT_ARCHIVED");
 
         // [3] PHONE FORMATTING (Strict E.164)
-        const rawFrom = getCallerId(campaign);
-        const fromNumber = rawFrom;
+        const rawFrom = process.env.PLIVO_PHONE_NUMBER || '';
+        const fromNumber = rawFrom.startsWith('+') ? rawFrom.trim() : `+${rawFrom.replace(/\D/g, '')}`;
         const rawTo = String(leadContext.phone).trim();
         const formattedTo = rawTo.startsWith('+') ? rawTo : `+${rawTo.replace(/\D/g, '')}`;
-        const websocketServerUrl = String(process.env.WEBSOCKET_SERVER_URL || '').trim().replace(/\/$/, '');
-        const answerUrl = `${websocketServerUrl}/answer?leadId=${lead_id}&campaignId=${campaign_id}`;
+        const answerUrl = `${process.env.WEBSOCKET_SERVER_URL}/answer?leadId=${lead_id}&campaignId=${campaign_id}`;
 
         console.log(`\n📞 [Queue Worker] PRE-DISPATCH CHECK:`);
         console.log(`   📤 FROM raw: '${rawFrom}' → formatted: '${fromNumber}'`);
@@ -123,7 +123,6 @@ async function executeCall(item) {
 
         if (!fromNumber || !fromNumber.startsWith('+') || fromNumber.replace(/\D/g, '').length < 10) throw new Error(`INVALID_SENDER_ID: '${fromNumber}'`);
         if (!formattedTo || formattedTo.replace(/\D/g, '').length < 10) throw new Error(`INVALID_DESTINATION_FORMAT: '${formattedTo}'`);
-        if (!websocketServerUrl || !/^https?:\/\//i.test(websocketServerUrl)) throw new Error(`INVALID_WEBSOCKET_SERVER_URL: '${websocketServerUrl}'`);
 
         // [4] PLIVO DISPATCH (Hardened Positional Args)
         const response = await plivoClient.calls.create(
