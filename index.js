@@ -115,6 +115,14 @@ function setCachedContext(id, data) {
     contextCache.set(id, { data, timestamp: Date.now() });
 }
 
+// Prune expired cache entries every 15 minutes
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, value] of contextCache.entries()) {
+        if (now - value.timestamp >= CACHE_TTL) contextCache.delete(key);
+    }
+}, 15 * 60 * 1000);
+
 /* -------------------------------
    AI ENGINE: OpenAI Realtime
 -------------------------------- */
@@ -177,9 +185,9 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
         const resetSilenceTimer = () => {
             if (silenceTimer) clearTimeout(silenceTimer);
             silenceTimer = setTimeout(async () => {
-                console.log(`🔇 [${callSid}] Silence Timeout (35s).`);
+                console.log(`🔇 [${callSid}] Silence Timeout (15s).`);
                 await handleDisconnect(plivoWS, realtimeWS, callSid, leadId, { reason: 'silence_timeout' }, callLogId);
-            }, 35000);
+            }, 15000);
         };
 
         // Handle OpenAI Readiness
@@ -188,18 +196,25 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
 
             await plivoWS.startPromise;
 
-            // Handshake context update
-            const initialSession = createSessionUpdate({ ...context, campaign }, campaign, [], []);
-            realtimeWS.send(JSON.stringify(initialSession));
+            // Await full context before triggering AI response.
+            // Prevents a second session.update from interrupting the AI's
+            // opening line and causing silent/garbled calls.
+            await fetchFullContext(realtimeWS, context, campaign, callSid);
             realtimeWS.send(JSON.stringify({ type: 'response.create' }));
-
-            // Async Context Warming
-            fetchFullContext(realtimeWS, context, campaign, callSid);
 
             // Log Session Start
             callLogId = await logCallStart(context, campaign, callSid);
             resetSilenceTimer();
         });
+
+        // Keepalive: ping OpenAI WS every 25s to prevent idle connection drops.
+        // Railway/cloud proxies drop connections after 30-60s of silence.
+        const keepaliveInterval = setInterval(() => {
+            if (realtimeWS.readyState === WebSocket.OPEN) realtimeWS.ping();
+            else clearInterval(keepaliveInterval);
+        }, 25000);
+
+        realtimeWS.on('pong', () => { /* connection alive */ });
 
         // Tool Execution Management
         const handleToolCall = async (response) => {
@@ -287,6 +302,7 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
 
         const cleanup = async () => {
             if (silenceTimer) clearTimeout(silenceTimer);
+            clearInterval(keepaliveInterval);
             if (realtimeWS.readyState === WebSocket.OPEN) realtimeWS.close();
             if (callLogId) {
                 await finalizeCallOutcome(callLogId, leadId, campaignId, conversationTranscript, callSid);
@@ -322,7 +338,9 @@ async function fetchFullContext(realtimeWS, lead, campaign, callSid) {
 
         const fullSession = createSessionUpdate(lead, campaign, projects, []);
         if (realtimeWS.readyState === WebSocket.OPEN) realtimeWS.send(JSON.stringify(fullSession));
-    } catch (err) { }
+    } catch (err) {
+        console.error(`❌ [${callSid}] fetchFullContext failed:`, err.message);
+    }
 }
 
 async function logCallStart(lead, campaign, callSid) {
@@ -433,18 +451,20 @@ async function handleDetailedInventory(leadId, args) {
 async function handleLogIntent(leadId, args, callLogId) {
     const { error } = await supabase.from('leads').update({
         interest_level: args.interest_level,
-        min_budget: args.budget_min,
-        max_budget: args.budget_max,
-        category_interest: args.category?.toLowerCase(),
-        property_type_interest: args.property_type,
-        transaction_type_interest: args.transaction_type?.toLowerCase(),
-        preferred_bhk: args.config_preference || args.bhk,
-        preferences: {
-            vastu_required: args.is_vastu_required,
-            preferred_facing: args.preferred_facing,
-            balconies_needed: args.balconies
-        },
-        pain_points: args.pain_points
+        metadata: {
+            budget_min: args.budget_min,
+            budget_max: args.budget_max,
+            category_interest: args.category?.toLowerCase(),
+            property_type_interest: args.property_type,
+            transaction_type_interest: args.transaction_type?.toLowerCase(),
+            preferred_bhk: args.config_preference || args.bhk,
+            preferences: {
+                vastu_required: args.is_vastu_required,
+                preferred_facing: args.preferred_facing,
+                balconies_needed: args.balconies
+            },
+            pain_points: args.pain_points
+        }
     }).eq('id', leadId);
 
     await supabase.from('call_logs').update({
@@ -459,7 +479,7 @@ async function handleTransfer(plivoWS, realtimeWS, callSid, leadId, campaignId, 
     const { data: agents } = await supabase.from('profiles').select('phone, full_name').eq('organization_id', org.organization_id).eq('role', 'employee').eq('status', 'active').limit(1);
 
     const target = agents?.[0]?.phone || process.env.PLIVO_TRANSFER_NUMBER;
-    const url = `${process.env.NEXT_PUBLIC_SITE_URL}/api/webhooks/plivo/transfer?to=${encodeURIComponent(target)}&leadId=${leadId}&campaignId=${campaignId}`;
+    const url = `${process.env.FRONTEND_URL}/api/webhooks/plivo/transfer?to=${encodeURIComponent(target)}&leadId=${leadId}&campaignId=${campaignId}`;
 
     await plivoClient.calls.transfer(callSid, { legs: 'aleg', aleg_url: url, aleg_method: 'POST' });
     await supabase.from('call_logs').update({ transferred: true, call_status: 'transferred' }).eq('id', callLogId);
@@ -496,7 +516,9 @@ async function finalizeCallOutcome(callLogId, leadId, campaignId, transcript, ca
     try {
         await supabase.from('call_logs').update({ conversation_transcript: transcript, ended_at: new Date().toISOString() }).eq('id', callLogId);
         analyzeSentiment(transcript, leadId, callLogId, null, callSid);
-    } catch (err) { }
+    } catch (err) {
+        console.error(`❌ [${callSid}] finalizeCallOutcome failed:`, err.message);
+    }
 }
 
 /* -------------------------------

@@ -158,13 +158,6 @@ async function executeCall(item) {
             updated_at: new Date()
         }).eq('id', id);
 
-        // Audit Log Entry
-        await supabase.from('call_attempts').insert({
-            organization_id, lead_id, campaign_id,
-            attempt_number: attempt_count + 1,
-            outcome: 'failed',
-            error_message: err.message
-        });
     }
 }
 
