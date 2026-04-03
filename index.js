@@ -281,8 +281,11 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
                         if (plivoWS.readyState === WebSocket.OPEN) {
                             plivoWS.send(JSON.stringify({
                                 event: 'playAudio',
-                                media: { payload: response.delta },
-                                streamId: plivoWS.streamId
+                                media: {
+                                    contentType: 'audio/x-mulaw',
+                                    sampleRate: 8000,
+                                    payload: response.delta
+                                }
                             }));
                         }
                         break;
