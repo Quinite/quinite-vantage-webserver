@@ -152,7 +152,7 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
         // Fetch campaign independently (leads may not be linked to campaigns yet)
         const { data: campaignData } = await supabase
             .from('campaigns')
-            .select('*, organization:organizations!inner(id, subscription_status, call_credits(*))')
+            .select('*, organization:organizations!inner(id, name, caller_id, subscription_status, call_credits(*))')
             .eq('id', campaignId)
             .single();
 
@@ -180,14 +180,19 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
 
         let conversationTranscript = '';
         let callLogId = null;
+        let callStartTime = null;
         let silenceTimer = null;
+        let cleanupCalled = false;
+
+        // Silence timeout respects campaign call_settings
+        const silenceTimeoutMs = (campaign.call_settings?.silence_timeout || 15) * 1000;
 
         const resetSilenceTimer = () => {
             if (silenceTimer) clearTimeout(silenceTimer);
             silenceTimer = setTimeout(async () => {
-                console.log(`🔇 [${callSid}] Silence Timeout (15s).`);
+                console.log(`🔇 [${callSid}] Silence Timeout (${silenceTimeoutMs / 1000}s).`);
                 await handleDisconnect(plivoWS, realtimeWS, callSid, leadId, { reason: 'silence_timeout' }, callLogId);
-            }, 15000);
+            }, silenceTimeoutMs);
         };
 
         // Handle OpenAI Readiness
@@ -204,6 +209,7 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
 
             // Log Session Start
             callLogId = await logCallStart(context, campaign, callSid);
+            callStartTime = Date.now();
             resetSilenceTimer();
         });
 
@@ -240,7 +246,7 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
                         result = await handleDetailedInventory(leadId, args);
                         break;
                     case 'schedule_callback':
-                        result = await handleScheduleCallback(leadId, args);
+                        result = await handleScheduleCallback(leadId, campaignId, args);
                         break;
                     case 'log_intent':
                         result = await handleLogIntent(leadId, args, callLogId);
@@ -304,11 +310,13 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
         });
 
         const cleanup = async () => {
+            if (cleanupCalled) return;
+            cleanupCalled = true;
             if (silenceTimer) clearTimeout(silenceTimer);
             clearInterval(keepaliveInterval);
             if (realtimeWS.readyState === WebSocket.OPEN) realtimeWS.close();
             if (callLogId) {
-                await finalizeCallOutcome(callLogId, leadId, campaignId, conversationTranscript, callSid);
+                await finalizeCallOutcome(callLogId, leadId, campaignId, conversationTranscript, callSid, callStartTime || Date.now(), organization.id);
             }
         };
 
@@ -358,7 +366,15 @@ async function logCallStart(lead, campaign, callSid) {
         caller_number: getCallerId(campaign),
         callee_number: lead.phone
     }).select('id').single();
-    return data?.id;
+    const logId = data?.id;
+    if (logId) {
+        // Link lead to this call log and increment total call count
+        await Promise.all([
+            supabase.from('leads').update({ call_log_id: logId }).eq('id', lead.id),
+            supabase.rpc('increment_campaign_stat', { campaign_uuid: campaign.id, stat_name: 'total_calls' })
+        ]);
+    }
+    return logId;
 }
 
 async function handleDetailedInventory(leadId, args) {
@@ -386,9 +402,9 @@ async function handleDetailedInventory(leadId, args) {
     if (args.transaction_type) query = query.eq('transaction_type', args.transaction_type.toLowerCase());
     if (args.property_type) query = query.ilike('unit_configs.property_type', `%${args.property_type}%`);
 
-    // Config Name vs Bedrooms (Handle 1BHK, 2BHK etc)
-    if (args.config_name) query = query.ilike('unit_configs.config_name', `%${args.config_name}%`);
-    if (args.bedrooms) query = query.eq('bedrooms', args.bedrooms);
+    // Config name takes precedence for BHK lookup (2.5BHK units have null bedrooms field)
+    if (args.config_name) query = query.filter('config.config_name', 'ilike', `%${args.config_name}%`);
+    else if (args.bedrooms) query = query.eq('bedrooms', args.bedrooms);
 
     // Pricing Filters
     if (args.price_min) query = query.gte('total_price', args.price_min);
@@ -485,7 +501,10 @@ async function handleTransfer(plivoWS, realtimeWS, callSid, leadId, campaignId, 
     const url = `${process.env.FRONTEND_URL}/api/webhooks/plivo/transfer?to=${encodeURIComponent(target)}&leadId=${leadId}&campaignId=${campaignId}`;
 
     await plivoClient.calls.transfer(callSid, { legs: 'aleg', aleg_url: url, aleg_method: 'POST' });
-    await supabase.from('call_logs').update({ transferred: true, call_status: 'transferred' }).eq('id', callLogId);
+    await Promise.all([
+        supabase.from('call_logs').update({ transferred: true, call_status: 'transferred' }).eq('id', callLogId),
+        supabase.rpc('increment_campaign_stat', { campaign_uuid: campaignId, stat_name: 'transferred_calls' })
+    ]);
 
     plivoWS.send(JSON.stringify({ event: 'clearAudio' }));
     setTimeout(() => { plivoWS.close(); realtimeWS.close(); }, 700);
@@ -498,6 +517,14 @@ async function handleDisconnect(plivoWS, realtimeWS, callSid, leadId, args, call
         disconnect_reason: args.reason
     }).eq('id', callLogId);
 
+    // Flag lead as abusive if AI detected abuse
+    if (args.reason === 'abusive') {
+        await supabase.from('leads').update({
+            abuse_flag: true,
+            abuse_details: args.abuse_details || 'Abusive behavior detected during AI call'
+        }).eq('id', leadId);
+    }
+
     setTimeout(async () => {
         try { await plivoClient.calls.hangup(callSid); } catch (e) { }
         plivoWS.close();
@@ -506,19 +533,90 @@ async function handleDisconnect(plivoWS, realtimeWS, callSid, leadId, args, call
     return { success: true };
 }
 
-async function handleScheduleCallback(leadId, args) {
-    const { error } = await supabase.from('leads').update({
-        best_contact_time: args.time,
-        preferred_contact_method: 'call',
+async function handleScheduleCallback(leadId, campaignId, args) {
+    let callbackAt;
+    try {
+        callbackAt = new Date(args.callback_at).toISOString();
+        if (isNaN(new Date(args.callback_at))) throw new Error('invalid date');
+    } catch {
+        // Fallback: 24 hours from now if AI sent unparseable value
+        callbackAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    }
+
+    // 1. Update lead with callback time and waiting status
+    await supabase.from('leads').update({
+        callback_time: callbackAt,
         waiting_status: 'callback_scheduled'
     }).eq('id', leadId);
-    return { success: !error };
+
+    // 2. Re-queue or create call_queue entry to fire at the requested time
+    const { data: existing } = await supabase.from('call_queue')
+        .select('id')
+        .eq('lead_id', leadId)
+        .eq('campaign_id', campaignId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+    if (existing) {
+        await supabase.from('call_queue').update({
+            status: 'queued',
+            next_retry_at: callbackAt,
+            attempt_count: 0,
+            last_error: null
+        }).eq('id', existing.id);
+    } else {
+        const { data: lead } = await supabase.from('leads').select('organization_id').eq('id', leadId).single();
+        await supabase.from('call_queue').insert({
+            lead_id: leadId,
+            campaign_id: campaignId,
+            organization_id: lead.organization_id,
+            status: 'queued',
+            next_retry_at: callbackAt
+        });
+    }
+
+    return { success: true, scheduled_at: callbackAt };
 }
 
-async function finalizeCallOutcome(callLogId, leadId, campaignId, transcript, callSid) {
+async function finalizeCallOutcome(callLogId, leadId, campaignId, transcript, callSid, callStartTime, organizationId) {
     try {
-        await supabase.from('call_logs').update({ conversation_transcript: transcript, ended_at: new Date().toISOString() }).eq('id', callLogId);
-        analyzeSentiment(transcript, leadId, callLogId, null, callSid);
+        const endedAt = new Date().toISOString();
+        const durationSecs = Math.max(0, Math.round((Date.now() - callStartTime) / 1000));
+        const COST_PER_MINUTE = parseFloat(process.env.CALL_COST_PER_MINUTE || '0.50');
+        const callCost = parseFloat(((durationSecs / 60) * COST_PER_MINUTE).toFixed(4));
+
+        // Finalize call log — only set call_status='completed' if still 'in_progress'
+        // (handleDisconnect/handleTransfer may have already set a terminal status)
+        await supabase.from('call_logs')
+            .update({
+                conversation_transcript: transcript,
+                ended_at: endedAt,
+                duration: durationSecs,
+                call_cost: callCost,
+                call_status: 'completed'
+            })
+            .eq('id', callLogId)
+            .eq('call_status', 'in_progress');  // only overwrite if not already finalized
+
+        // Also ensure ended_at/duration/cost are set even for transferred/completed calls
+        await supabase.from('call_logs')
+            .update({ conversation_transcript: transcript, ended_at: endedAt, duration: durationSecs, call_cost: callCost })
+            .eq('id', callLogId)
+            .neq('call_status', 'in_progress');
+
+        // Deduct credits atomically (RPC enforces balance >= 0)
+        if (callCost > 0 && organizationId) {
+            await supabase.rpc('deduct_call_credits', { org_id: organizationId, deduction: callCost });
+        }
+
+        // Increment campaign answered_calls (any call with duration > 0 was answered)
+        if (durationSecs > 0) {
+            await supabase.rpc('increment_campaign_stat', { campaign_uuid: campaignId, stat_name: 'answered_calls' });
+        }
+
+        // Async sentiment analysis (non-blocking — errors caught inside)
+        analyzeSentiment(transcript, leadId, callLogId, organizationId, callSid, campaignId);
     } catch (err) {
         console.error(`❌ [${callSid}] finalizeCallOutcome failed:`, err.message);
     }

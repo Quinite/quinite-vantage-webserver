@@ -11,7 +11,7 @@ const openai = new OpenAI({
 /**
  * Production-Grade Sentiment Analysis for Indian Real Estate
  */
-export async function analyzeSentiment(transcript, leadId, callLogId, organizationId, callSid) {
+export async function analyzeSentiment(transcript, leadId, callLogId, organizationId, callSid, campaignId) {
     if (!transcript || transcript.length < 50) return null;
 
     try {
@@ -64,6 +64,14 @@ export async function analyzeSentiment(transcript, leadId, callLogId, organizati
             last_sentiment_score: analysis.sentiment_score,
             last_contacted_at: new Date().toISOString()
         }).eq('id', leadId);
+
+        // Update campaign running average sentiment score
+        if (campaignId && analysis.sentiment_score !== undefined) {
+            await supabase.rpc('update_campaign_sentiment', {
+                campaign_uuid: campaignId,
+                new_score: analysis.sentiment_score
+            });
+        }
 
         console.log(`✅ [${callSid}] Analysis Saved. Priority: ${analysis.priority}`);
         return analysis;
