@@ -3,7 +3,12 @@ import { logger } from '../lib/logger.js';
 
 export async function handleDetailedInventory(leadId, args) {
     const { data: lead } = await supabase.from('leads').select('project_id').eq('id', leadId).single();
-    if (!lead?.project_id) return { success: false, error: 'Project context missing.' };
+    if (!lead?.project_id) {
+        logger.warn('Inventory: no project_id for lead', { leadId });
+        return { success: false, error: 'Project context missing.' };
+    }
+
+    logger.info('Inventory lookup', { leadId, projectId: lead.project_id, filters: args });
 
     // Fetch units with joins — do NOT filter on joined table columns via SDK (unreliable).
     // Apply joined-table filters (category, property_type, config_name, carpet_area) in JS after fetch.
@@ -16,7 +21,6 @@ export async function handleDetailedInventory(leadId, args) {
     `)
         .eq('project_id', lead.project_id)
         .eq('status', 'available')
-        .is('archived_at', null)
         .eq('is_archived', false);
 
     // Apply direct-column filters only
@@ -30,15 +34,45 @@ export async function handleDetailedInventory(leadId, args) {
     if (args.floor_min) query = query.gte('floor_number', args.floor_min);
     if (args.floor_max) query = query.lte('floor_number', args.floor_max);
 
-    const { data: units, error } = await query.limit(20);
+    const { data: units, error } = await query.limit(30);
 
     if (error) {
-        logger.error('Inventory query failed', { leadId, error: error.message });
+        logger.error('Inventory query failed', { leadId, projectId: lead.project_id, error: error.message });
         return { success: false, error: 'Search failed. Please try again.' };
     }
 
+    logger.info('Inventory DB result', { leadId, projectId: lead.project_id, totalFromDB: units?.length || 0, filtersApplied: Object.keys(args).length });
+
+    // If filtered query returns nothing, try a broad fallback (just project + available)
     if (!units?.length) {
-        return { available: false, message: 'No available units in this project currently.' };
+        logger.warn('Inventory: zero results with filters, trying broad query', { leadId, projectId: lead.project_id, args });
+        const { data: broadUnits } = await supabase.from('units').select(`
+            id, unit_number, floor_number, facing, total_price, base_price,
+            bedrooms, bathrooms, balconies, is_corner, is_vastu_compliant,
+            possession_date, construction_status, transaction_type, status,
+            tower:towers(name, total_floors),
+            config:unit_configs(config_name, category, property_type, carpet_area, built_up_area, super_built_up_area, plot_area)
+        `)
+            .eq('project_id', lead.project_id)
+            .eq('status', 'available')
+            .eq('is_archived', false)
+            .limit(10);
+
+        if (broadUnits?.length) {
+            logger.info('Inventory: broad fallback found units', { leadId, count: broadUnits.length });
+            const top5 = broadUnits.slice(0, 5);
+            return {
+                available: true,
+                note: 'Exact match nahi mila, lekin ye similar options available hain.',
+                units: top5.map(u => formatUnit(u))
+            };
+        }
+
+        logger.warn('Inventory: truly zero units in project', { leadId, projectId: lead.project_id });
+        return {
+            available: false,
+            message: 'Is project mein abhi sab units booked hain. Naye inventory ke liye aapko notify kar denge. Kya koi aur project dekhna chahenge?'
+        };
     }
 
     // JS-level filtering for joined table columns — handles "2 BHK" / "2BHK" / "2bhk" variants
@@ -70,33 +104,40 @@ export async function handleDetailedInventory(leadId, args) {
     const top5 = filtered.slice(0, 5);
     const wasFiltered = top5.length < units.length && filtered.length === units.length && args.config_name;
 
+    logger.info('Inventory result', { leadId, dbCount: units.length, filteredCount: filtered.length, returning: top5.length });
+
     return {
         available: true,
-        ...(wasFiltered && { note: 'Exact BHK match not found — showing closest available units.' }),
-        units: top5.map(u => ({
-            unit_id: u.id,
-            unit_no: u.unit_number,
-            tower: u.tower?.name,
-            floor: u.floor_number,
-            config: u.config?.config_name,
-            category: u.config?.category,
-            type: u.config?.property_type,
-            transaction: u.transaction_type,
-            bedrooms: u.bedrooms,
-            bathrooms: u.bathrooms,
-            balconies: u.balconies,
-            area: {
-                carpet: u.config?.carpet_area,
-                built_up: u.config?.built_up_area,
-                super_built: u.config?.super_built_up_area,
-                plot: u.config?.plot_area
-            },
-            price: u.total_price || u.base_price,
-            facing: u.facing,
-            vastu: u.is_vastu_compliant ? 'Yes' : 'No',
-            corner_unit: u.is_corner ? 'Yes' : 'No',
-            possession: u.possession_date,
-            construction: u.construction_status?.replace(/_/g, ' ')
-        }))
+        total_available: filtered.length,
+        ...(wasFiltered && { note: 'Exact BHK match nahi mila — ye closest available units hain.' }),
+        units: top5.map(u => formatUnit(u))
+    };
+}
+
+function formatUnit(u) {
+    return {
+        unit_id: u.id,
+        unit_no: u.unit_number,
+        tower: u.tower?.name,
+        floor: u.floor_number,
+        config: u.config?.config_name,
+        category: u.config?.category,
+        type: u.config?.property_type,
+        transaction: u.transaction_type,
+        bedrooms: u.bedrooms,
+        bathrooms: u.bathrooms,
+        balconies: u.balconies,
+        area: {
+            carpet: u.config?.carpet_area,
+            built_up: u.config?.built_up_area,
+            super_built: u.config?.super_built_up_area,
+            plot: u.config?.plot_area
+        },
+        price: u.total_price || u.base_price,
+        facing: u.facing,
+        vastu: u.is_vastu_compliant ? 'Yes' : 'No',
+        corner_unit: u.is_corner ? 'Yes' : 'No',
+        possession: u.possession_date,
+        construction: u.construction_status?.replace(/_/g, ' ')
     };
 }

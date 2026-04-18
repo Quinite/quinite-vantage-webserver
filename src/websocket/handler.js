@@ -214,6 +214,16 @@ async function sendSessionUpdate(realtimeWS, lead, campaign, callSid) {
         setCachedContext(cacheKey, projects);
     }
 
+    logger.info('Session context', {
+        callSid,
+        leadName: lead.name,
+        leadProject: lead.project?.name || 'none',
+        projectId: lead.project_id,
+        orgProjects: projects.map(p => p.name),
+        language: campaign.call_settings?.language,
+        voice: campaign.call_settings?.voice_id
+    });
+
     const sessionUpdate = createSessionUpdate(lead, campaign, projects);
     if (realtimeWS.readyState === WebSocket.OPEN) {
         realtimeWS.send(JSON.stringify(sessionUpdate));
