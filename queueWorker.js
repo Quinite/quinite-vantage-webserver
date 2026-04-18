@@ -1,37 +1,27 @@
 import { supabase } from './services/supabase.js';
-import { plivoClient, getCallerId } from './services/plivo.js';
+import { plivoClient } from './services/plivo.js';
+import { logger } from './src/lib/logger.js';
 import dotenv from 'dotenv';
-import { dirname } from 'path';
-import { fileURLToPath } from 'url';
 
 dotenv.config();
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const WEBSOCKET_SERVER_URL = process.env.WEBSOCKET_SERVER_URL;
 const POLL_INTERVAL_MS = 4000;
-const MAX_CONCURRENT_CALLS = 10; 
-const RETRY_DELAY_MINUTES = 20;
+const MAX_CONCURRENT_CALLS = 10;
 
-console.log("🚀 Starting Production-Grade Queue Worker...");
+logger.info('Queue worker starting');
 
-/**
- * Polls the database for the highest priority leads ready for a call.
- */
 async function processQueue() {
     try {
         const now = new Date().toISOString();
-        console.log(`📥 [Queue Worker] Heartbeat: ${now}`);
-        // [1] POLLING: Nested .in() filters are NOT supported by Supabase JS SDK
-        // We fetch all pending items then filter in JS
+
         const { data: rawItems, error } = await supabase
             .from('call_queue')
             .select(`
                 *,
                 campaign:campaigns(
-                    status,
-                    ai_script,
-                    call_settings,
+                    id, status, organization_id, call_settings, time_start, time_end,
                     organization:organizations(
+                        id,
                         subscription_status,
                         call_credits(*)
                     )
@@ -40,65 +30,67 @@ async function processQueue() {
             .in('status', ['queued', 'failed'])
             .lte('next_retry_at', now)
             .lt('attempt_count', 4)
-            .order('priority', { ascending: false })
             .order('created_at', { ascending: true })
             .limit(50);
 
-        // JS-level filter for campaign and subscription status
+        if (error) {
+            logger.error('Queue fetch error', { error: error.message });
+            return;
+        }
+
         const queueItems = (rawItems || []).filter(item => {
             const campStatus = item.campaign?.status;
             const subStatus = item.campaign?.organization?.subscription_status;
             return ['active', 'running'].includes(campStatus) && ['active', 'trialing'].includes(subStatus);
         }).slice(0, MAX_CONCURRENT_CALLS);
 
-        const queueError = error;
+        if (!queueItems.length) return;
 
-        if (queueError) {
-            console.error("❌ Queue fetch error:", queueError.message);
-            return;
-        }
-
-        console.log(`📊 [Queue Worker] Found ${rawItems?.length || 0} raw items, ${queueItems.length} eligible after filtering.`);
-
-        if (!queueItems?.length) {
-            console.log('😴 [Queue Worker] No calls ready to process.');
-            return;
-        }
-
-        // Parallel execution with atomic lock handling in executeCall
+        logger.info('Queue processing', { eligible: queueItems.length, total: rawItems?.length });
         await Promise.allSettled(queueItems.map(item => executeCall(item)));
 
     } catch (err) {
-        console.error("❌ Loop Error:", err.message);
+        logger.error('Queue loop error', { error: err.message });
     }
 }
 
-/**
- * Executes the Plivo outbound call with strict lifecycle validation.
- */
 async function executeCall(item) {
     const { id, lead_id, campaign_id, attempt_count, organization_id, campaign } = item;
 
-    // Credit Balance Check (Supabase returns 1-to-1 as object in this join)
-    const credits = campaign?.organization?.call_credits;
-    const balance = credits ? parseFloat(credits.balance) : 0;
-    
-    if (balance < 0.2) {
-        console.warn(`🛑 [Queue Worker] Insufficient Credits for Org ${organization_id} (Balance: ${balance})`);
+    // Security: verify queue item belongs to the correct organization
+    if (organization_id && campaign?.organization_id && organization_id !== campaign.organization_id) {
+        logger.error('Org mismatch on queue item — possible tampering', { queueId: id, organization_id, campaignOrgId: campaign.organization_id });
+        await supabase.from('call_queue').update({ status: 'failed', last_error: 'org_mismatch_security' }).eq('id', id);
+        return;
     }
 
+    // Check campaign time window (IST)
+    if (campaign?.time_start && campaign?.time_end) {
+        const nowIST = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false, hour: '2-digit', minute: '2-digit' });
+        if (nowIST < campaign.time_start || nowIST > campaign.time_end) {
+            // Reschedule to next window open — not a failure
+            const nextWindow = computeNextWindowOpen(campaign.time_start);
+            await supabase.from('call_queue').update({ status: 'queued', next_retry_at: nextWindow }).eq('id', id);
+            logger.info('Call outside time window — rescheduled', { queueId: id, nowIST, window: `${campaign.time_start}–${campaign.time_end}` });
+            return;
+        }
+    }
+
+    const credits = campaign?.organization?.call_credits;
+    const balance = credits ? parseFloat(credits.balance ?? credits[0]?.balance ?? 0) : 0;
+
     try {
-        // [1] ATOMIC LOCK: Prevent double-calling
+        // Atomic lock — prevents double-calling
         const { data: lockedItem, error: lockError } = await supabase
             .from('call_queue')
             .update({ status: 'processing', updated_at: new Date() })
             .match({ id, status: item.status })
-            .select().single();
+            .select()
+            .single();
 
         if (lockError || !lockedItem) return;
 
-        // [2] BILLING & DATA HEARTBEAT
-        if (balance < 0.2) throw new Error("INSUFFICIENT_FUNDS");
+        if (balance < 0.2) throw new Error('INSUFFICIENT_FUNDS');
 
         const { data: leadContext } = await supabase
             .from('leads')
@@ -106,68 +98,67 @@ async function executeCall(item) {
             .eq('id', lead_id)
             .single();
 
-        if (!leadContext || !leadContext.phone) throw new Error("INVALID_LEAD_DATA");
-        if (leadContext.project?.archived_at) throw new Error("PROJECT_ARCHIVED");
+        if (!leadContext?.phone) throw new Error('INVALID_LEAD_DATA');
+        if (leadContext.project?.archived_at) throw new Error('PROJECT_ARCHIVED');
 
-        // [3] PHONE FORMATTING (Strict E.164)
         const rawFrom = process.env.PLIVO_PHONE_NUMBER || '';
         const fromNumber = rawFrom.startsWith('+') ? rawFrom.trim() : `+${rawFrom.replace(/\D/g, '')}`;
         const rawTo = String(leadContext.phone).trim();
         const formattedTo = rawTo.startsWith('+') ? rawTo : `+${rawTo.replace(/\D/g, '')}`;
+
+        if (!fromNumber.startsWith('+') || fromNumber.replace(/\D/g, '').length < 10) throw new Error(`INVALID_SENDER_ID: '${fromNumber}'`);
+        if (!formattedTo || formattedTo.replace(/\D/g, '').length < 10) throw new Error(`INVALID_DESTINATION: '${formattedTo}'`);
+
         const answerUrl = `${process.env.WEBSOCKET_SERVER_URL}/answer?leadId=${lead_id}&campaignId=${campaign_id}`;
-
-        console.log(`\n📞 [Queue Worker] PRE-DISPATCH CHECK:`);
-        console.log(`   📤 FROM raw: '${rawFrom}' → formatted: '${fromNumber}'`);
-        console.log(`   📥 TO raw: '${leadContext.phone}' → formatted: '${formattedTo}'`);
-        console.log(`   🔗 URL: ${answerUrl}`);
-
-        if (!fromNumber || !fromNumber.startsWith('+') || fromNumber.replace(/\D/g, '').length < 10) throw new Error(`INVALID_SENDER_ID: '${fromNumber}'`);
-        if (!formattedTo || formattedTo.replace(/\D/g, '').length < 10) throw new Error(`INVALID_DESTINATION_FORMAT: '${formattedTo}'`);
-
-        // [4] PLIVO DISPATCH (Hardened Positional Args)
-        const response = await plivoClient.calls.create(
-            fromNumber,
-            formattedTo,
-            answerUrl,
-            {
-                answer_method: 'POST',
-                time_limit: 1800 // 30 mins max
-            }
-        );
+        const response = await plivoClient.calls.create(fromNumber, formattedTo, answerUrl, {
+            answer_method: 'POST',
+            time_limit: 1800
+        });
 
         const callSid = response.requestUuid || response.callUuid;
-        console.log(`✅ [Queue Worker] SUCCESS | SID: ${callSid}`);
+        logger.info('Call dispatched', { callSid, leadId: lead_id, campaignId: campaign_id });
 
-        // [5] UPDATE STATE
         await supabase.from('call_queue').update({ status: 'completed', updated_at: new Date() }).eq('id', id);
-        await supabase.from('leads').update({ call_status: 'calling', last_contacted_at: new Date().toISOString() }).eq('id', lead_id);
+        await supabase.from('leads').update({ last_contacted_at: new Date().toISOString() }).eq('id', lead_id);
 
     } catch (err) {
-        console.error(`❌ [Queue Worker] FAILURE [Item ${id}]:`, err.message);
-        
-        const nextRetry = new Date();
-        const backoffMinutes = (attempt_count + 1) * 30; // 30, 60, 90 mins backoff
-        nextRetry.setMinutes(nextRetry.getMinutes() + backoffMinutes);
+        logger.error('Call execution failed', { queueId: id, error: err.message });
 
-        // Update Queue Item with Error Detail
+        const isInsufficientFunds = err.message === 'INSUFFICIENT_FUNDS';
+        const retryDelayMs = isInsufficientFunds ? 5 * 60 * 1000 : (attempt_count + 1) * 30 * 60 * 1000;
+
         await supabase.from('call_queue').update({
-            status: err.message === 'INSUFFICIENT_FUNDS' ? 'queued' : 'failed',
-            attempt_count: err.message === 'INSUFFICIENT_FUNDS' ? attempt_count : attempt_count + 1,
+            status: isInsufficientFunds ? 'queued' : 'failed',
+            attempt_count: isInsufficientFunds ? attempt_count : attempt_count + 1,
             last_error: err.message,
-            next_retry_at: err.message === 'INSUFFICIENT_FUNDS' ? new Date(Date.now() + 300000).toISOString() : nextRetry.toISOString(),
+            next_retry_at: new Date(Date.now() + retryDelayMs).toISOString(),
             updated_at: new Date()
         }).eq('id', id);
-
     }
+}
+
+function computeNextWindowOpen(timeStart) {
+    // Schedule for the time_start tomorrow (IST)
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const [hours, minutes] = timeStart.split(':').map(Number);
+    const nextOpen = new Date(tomorrow.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }));
+    nextOpen.setHours(hours - 5, minutes - 30, 0, 0); // Convert IST to UTC
+    return nextOpen.toISOString();
 }
 
 async function cleanupStuckCalls() {
     const timeout = new Date(Date.now() - 15 * 60 * 1000).toISOString();
-    await supabase.from('call_queue').update({ status: 'queued' }).eq('status', 'processing').lt('updated_at', timeout);
+    const { data } = await supabase.from('call_queue')
+        .update({ status: 'queued', updated_at: new Date() })
+        .eq('status', 'processing')
+        .lt('updated_at', timeout)
+        .select('id');
+    if (data?.length) logger.warn('Stuck calls reset', { count: data.length });
 }
 
 setInterval(processQueue, POLL_INTERVAL_MS);
-setInterval(cleanupStuckCalls, 120000);
+setInterval(cleanupStuckCalls, 2 * 60 * 1000);
 
 process.on('SIGTERM', () => process.exit(0));
 process.on('SIGINT', () => process.exit(0));

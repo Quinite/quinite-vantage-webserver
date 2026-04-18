@@ -1,51 +1,50 @@
 import OpenAI from 'openai';
 import { supabase } from './supabase.js';
+import { logger } from '../src/lib/logger.js';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
-const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY
-});
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-/**
- * Production-Grade Sentiment Analysis for Indian Real Estate
- */
 export async function analyzeSentiment(transcript, leadId, callLogId, organizationId, callSid, campaignId) {
     if (!transcript || transcript.length < 50) return null;
 
     try {
-        console.log(`🧠 [${callSid}] Running Contextual Sentiment Analysis...`);
+        logger.info('Running sentiment analysis', { callSid });
 
         const completion = await openai.chat.completions.create({
-            model: "gpt-4o-mini",
+            model: 'gpt-4o-mini',
             messages: [{
-                role: "system",
-                content: `You are an expert Indian Real Estate Analyst. Analyze this sales transcript.
-                Extract structured insights focused on the lead's intent and budget.
-                Return JSON: {
-                  "sentiment_score": float (-1 to 1),
-                  "interest_level": "high" | "medium" | "low" | "none",
-                  "summary": "1-sentence conversational summary",
-                  "objections": ["list", "of", "objections"],
-                  "budget": "estimated budget if mentioned",
-                  "priority": float (0-100),
-                  "key_takeaways": "bullet points"
-                }`
+                role: 'system',
+                content: `You are an expert Indian Real Estate Analyst. Analyze this sales call transcript.
+Return JSON only:
+{
+  "sentiment_score": float (-1 to 1),
+  "interest_level": "high" | "medium" | "low" | "none",
+  "summary": "1-sentence summary of call outcome",
+  "objections": ["array of objections raised"],
+  "budget": "estimated budget if mentioned, else null",
+  "priority": float (0-100, higher = hotter lead),
+  "key_takeaways": "bullet point summary"
+}`
             }, {
-                role: "user",
+                role: 'user',
                 content: transcript
             }],
-            response_format: { type: "json_object" },
+            response_format: { type: 'json_object' },
             temperature: 0
         });
 
         const analysis = JSON.parse(completion.choices[0].message.content);
-        
-        // 1. UPDATE CALL LOG (Consolidated Source)
-        const { error: callLogError } = await supabase.from('call_logs').update({
+
+        const sentimentLabel = analysis.sentiment_score > 0.3 ? 'Positive'
+            : analysis.sentiment_score < -0.3 ? 'Negative' : 'Neutral';
+
+        await supabase.from('call_logs').update({
             summary: analysis.summary,
             sentiment_score: analysis.sentiment_score,
+            sentiment_label: sentimentLabel,
             interest_level: analysis.interest_level,
             ai_metadata: {
                 objections: analysis.objections,
@@ -55,29 +54,25 @@ export async function analyzeSentiment(transcript, leadId, callLogId, organizati
             }
         }).eq('id', callLogId);
 
-        if (callLogError) throw callLogError;
-
-        // 2. UPDATE LEAD BEHAVIORAL DATA
+        // Update lead with AI-derived behavioral signals
         await supabase.from('leads').update({
             interest_level: analysis.interest_level,
-            score: Math.round(analysis.priority), // Priority maps to Lead Score
+            score: Math.round(analysis.priority),
             last_sentiment_score: analysis.sentiment_score,
-            last_contacted_at: new Date().toISOString()
         }).eq('id', leadId);
 
-        // Update campaign running average sentiment score
-        if (campaignId && analysis.sentiment_score !== undefined) {
+        if (campaignId && analysis.sentiment_score != null) {
             await supabase.rpc('update_campaign_sentiment', {
                 campaign_uuid: campaignId,
                 new_score: analysis.sentiment_score
             });
         }
 
-        console.log(`✅ [${callSid}] Analysis Saved. Priority: ${analysis.priority}`);
+        logger.info('Sentiment analysis complete', { callSid, priority: analysis.priority, interest: analysis.interest_level });
         return analysis;
 
     } catch (err) {
-        console.error(`❌ [${callSid}] Sentiment Error:`, err.message);
+        logger.error('Sentiment analysis failed', { callSid, error: err.message });
         return null;
     }
 }
