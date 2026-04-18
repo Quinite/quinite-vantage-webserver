@@ -132,6 +132,7 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
 
     try {
         // [1] Pre-emptive OpenAI Connection
+        console.log(`🔑 [${callSid}] OpenAI key: ${OPENAI_API_KEY ? `present (${OPENAI_API_KEY.length} chars)` : '❌ MISSING'}`);
         const realtimeWS = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview', {
             headers: {
                 'Authorization': `Bearer ${OPENAI_API_KEY}`,
@@ -163,12 +164,15 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
             .eq('id', leadId)
             .single();
 
+        if (!context) console.warn(`⚠️ [${callSid}] Lead query done — context: ${context ? 'ok' : 'null'}, error: ${contextError?.message}`);
+
         // Fetch campaign independently (leads may not be linked to campaigns yet)
         const { data: campaignData } = await supabase
             .from('campaigns')
             .select('*, organization:organizations!inner(id, name, caller_id, subscription_status, call_credits(*))')
             .eq('id', campaignId)
             .single();
+        if (!campaignData) console.warn(`⚠️ [${callSid}] Campaign query done — campaignData: ${campaignData ? 'ok' : 'null'}`);
 
         if (contextError || !context || !campaignData) {
             console.error(`❌ [${callSid}] Handshake Failed:`, contextError?.message || 'Missing campaign');
