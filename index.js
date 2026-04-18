@@ -139,6 +139,20 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
             }
         });
 
+        realtimeWS.on('error', (err) => {
+            console.error(`❌ [${callSid}] OpenAI WS Error: ${err.message}`);
+            // 'close' fires after 'error' — cleanup() handles finalization
+        });
+
+        const startupTimeout = setTimeout(async () => {
+            if (realtimeWS.readyState !== WebSocket.OPEN) {
+                console.error(`❌ [${callSid}] OpenAI connect timeout (10s) — hanging up.`);
+                realtimeWS.terminate();
+                try { await plivoClient.calls.hangup(callSid); } catch (_) {}
+                plivoWS.close();
+            }
+        }, 10000);
+
         // [2] Optimized Single-Query Context Join
         const { data: context, error: contextError } = await supabase
             .from('leads')
@@ -158,6 +172,8 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
 
         if (contextError || !context || !campaignData) {
             console.error(`❌ [${callSid}] Handshake Failed:`, contextError?.message || 'Missing campaign');
+            clearTimeout(startupTimeout);
+            realtimeWS.close();
             return null;
         }
 
@@ -170,11 +186,15 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
         // [3] Lifecycle & Billing Validation
         if (!['active', 'running'].includes(campaign.status) || (project && project.archived_at)) {
             console.warn(`🛑 [${callSid}] Campaign/Project Inactive (${campaign.status}).`);
+            clearTimeout(startupTimeout);
+            realtimeWS.close();
             return null;
         }
 
         if (!['active', 'trialing'].includes(organization.subscription_status) || balance < 0.5) {
             console.warn(`💳 [${callSid}] Credits Exhausted/Sub Inactive (Sub: ${organization.subscription_status}, Bal: ${balance}).`);
+            clearTimeout(startupTimeout);
+            realtimeWS.close();
             return null;
         }
 
@@ -197,20 +217,29 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
 
         // Handle OpenAI Readiness
         realtimeWS.on('open', async () => {
-            console.log(`✅ [${callSid}] OpenAI Ready!`);
+            try {
+                clearTimeout(startupTimeout);
+                console.log(`✅ [${callSid}] OpenAI Ready!`);
 
-            await plivoWS.startPromise;
+                await plivoWS.startPromise;
 
-            // Await full context before triggering AI response.
-            // Prevents a second session.update from interrupting the AI's
-            // opening line and causing silent/garbled calls.
-            await fetchFullContext(realtimeWS, context, campaign, callSid);
-            realtimeWS.send(JSON.stringify({ type: 'response.create' }));
+                // Await full context before triggering AI response.
+                // Prevents a second session.update from interrupting the AI's
+                // opening line and causing silent/garbled calls.
+                await fetchFullContext(realtimeWS, context, campaign, callSid);
+                realtimeWS.send(JSON.stringify({ type: 'response.create' }));
+                console.log(`🎤 [${callSid}] response.create sent — AI should speak now.`);
 
-            // Log Session Start
-            callLogId = await logCallStart(context, campaign, callSid);
-            callStartTime = Date.now();
-            resetSilenceTimer();
+                // Log Session Start
+                callLogId = await logCallStart(context, campaign, callSid);
+                callStartTime = Date.now();
+                resetSilenceTimer();
+            } catch (err) {
+                console.error(`❌ [${callSid}] Open handler crash: ${err.message}`);
+                realtimeWS.close();
+                try { await plivoClient.calls.hangup(callSid); } catch (_) {}
+                plivoWS.close();
+            }
         });
 
         // Keepalive: ping OpenAI WS every 25s to prevent idle connection drops.
@@ -312,6 +341,7 @@ const startRealtimeWSConnection = async (plivoWS, leadId, campaignId, callSid) =
         const cleanup = async () => {
             if (cleanupCalled) return;
             cleanupCalled = true;
+            clearTimeout(startupTimeout);
             if (silenceTimer) clearTimeout(silenceTimer);
             clearInterval(keepaliveInterval);
             if (realtimeWS.readyState === WebSocket.OPEN) realtimeWS.close();
@@ -348,7 +378,10 @@ async function fetchFullContext(realtimeWS, lead, campaign, callSid) {
         }
 
         const fullSession = createSessionUpdate(lead, campaign, projects, []);
-        if (realtimeWS.readyState === WebSocket.OPEN) realtimeWS.send(JSON.stringify(fullSession));
+        if (realtimeWS.readyState === WebSocket.OPEN) {
+            realtimeWS.send(JSON.stringify(fullSession));
+            console.log(`📤 [${callSid}] session.update sent (voice: ${campaign.call_settings?.voice_id || 'shimmer'}, lang: ${campaign.call_settings?.language || 'hinglish'})`);
+        }
     } catch (err) {
         console.error(`❌ [${callSid}] fetchFullContext failed:`, err.message);
     }
