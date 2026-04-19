@@ -58,7 +58,6 @@ Return JSON only:
         await supabase.from('leads').update({
             interest_level: analysis.interest_level,
             score: Math.round(analysis.priority),
-            last_sentiment_score: analysis.sentiment_score,
         }).eq('id', leadId);
 
         if (campaignId && analysis.sentiment_score != null) {

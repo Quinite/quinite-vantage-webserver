@@ -19,7 +19,7 @@ async function processQueue() {
             .select(`
                 *,
                 campaign:campaigns(
-                    id, status, organization_id, call_settings, time_start, time_end,
+                    id, status, organization_id, call_settings, time_start, time_end, dnd_compliance,
                     organization:organizations(
                         id,
                         subscription_status,
@@ -41,7 +41,7 @@ async function processQueue() {
         const queueItems = (rawItems || []).filter(item => {
             const campStatus = item.campaign?.status;
             const subStatus = item.campaign?.organization?.subscription_status;
-            return ['active', 'running'].includes(campStatus) && ['active', 'trialing'].includes(subStatus);
+            return campStatus === 'running' && ['active', 'trialing'].includes(subStatus);
         }).slice(0, MAX_CONCURRENT_CALLS);
 
         if (!queueItems.length) return;
@@ -65,13 +65,22 @@ async function executeCall(item) {
     }
 
     // Check campaign time window (IST)
+    const nowIST = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false, hour: '2-digit', minute: '2-digit' });
     if (campaign?.time_start && campaign?.time_end) {
-        const nowIST = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false, hour: '2-digit', minute: '2-digit' });
         if (nowIST < campaign.time_start || nowIST > campaign.time_end) {
-            // Reschedule to next window open — not a failure
             const nextWindow = computeNextWindowOpen(campaign.time_start);
             await supabase.from('call_queue').update({ status: 'queued', next_retry_at: nextWindow }).eq('id', id);
             logger.info('Call outside time window — rescheduled', { queueId: id, nowIST, window: `${campaign.time_start}–${campaign.time_end}` });
+            return;
+        }
+    }
+
+    // DND compliance: 9am-9pm IST (TRAI rules)
+    if (campaign?.dnd_compliance !== false) {
+        if (nowIST < '09:00' || nowIST > '21:00') {
+            const nextWindow = computeNextWindowOpen(campaign?.time_start || '09:00');
+            await supabase.from('call_queue').update({ status: 'queued', next_retry_at: nextWindow }).eq('id', id);
+            logger.info('Call outside DND window — rescheduled', { queueId: id, nowIST });
             return;
         }
     }
@@ -94,11 +103,13 @@ async function executeCall(item) {
 
         const { data: leadContext } = await supabase
             .from('leads')
-            .select('name, phone, project:projects(archived_at)')
+            .select('name, phone, archived_at, do_not_call, project:projects(archived_at)')
             .eq('id', lead_id)
             .single();
 
         if (!leadContext?.phone) throw new Error('INVALID_LEAD_DATA');
+        if (leadContext.archived_at) throw new Error('LEAD_ARCHIVED');
+        if (leadContext.do_not_call) throw new Error('DO_NOT_CALL');
         if (leadContext.project?.archived_at) throw new Error('PROJECT_ARCHIVED');
 
         const rawFrom = process.env.PLIVO_PHONE_NUMBER || '';
@@ -110,19 +121,47 @@ async function executeCall(item) {
         if (!formattedTo || formattedTo.replace(/\D/g, '').length < 10) throw new Error(`INVALID_DESTINATION: '${formattedTo}'`);
 
         const answerUrl = `${process.env.WEBSOCKET_SERVER_URL}/answer?leadId=${lead_id}&campaignId=${campaign_id}`;
+        const recordingCallbackUrl = `${process.env.WEBSOCKET_SERVER_URL}/recording`;
         const response = await plivoClient.calls.create(fromNumber, formattedTo, answerUrl, {
             answer_method: 'POST',
-            time_limit: 1800
+            time_limit: 1800,
+            record: 'true',
+            record_callback_url: recordingCallbackUrl,
+            record_callback_method: 'POST',
         });
 
         const callSid = response.requestUuid || response.callUuid;
         logger.info('Call dispatched', { callSid, leadId: lead_id, campaignId: campaign_id });
 
         await supabase.from('call_queue').update({ status: 'completed', updated_at: new Date() }).eq('id', id);
-        await supabase.from('leads').update({ last_contacted_at: new Date().toISOString() }).eq('id', lead_id);
+
+        // Mark campaign_leads as calling — call-end handler will update to called/failed
+        if (campaign_id) {
+            await supabase.from('campaign_leads').update({
+                status: 'calling',
+                last_call_attempt_at: new Date().toISOString(),
+                attempt_count: attempt_count + 1,
+                updated_at: new Date()
+            }).match({ campaign_id, lead_id });
+        }
 
     } catch (err) {
         logger.error('Call execution failed', { queueId: id, error: err.message });
+
+        const TERMINAL_ERRORS = ['LEAD_ARCHIVED', 'DO_NOT_CALL', 'PROJECT_ARCHIVED', 'INVALID_LEAD_DATA'];
+        if (TERMINAL_ERRORS.includes(err.message)) {
+            // No retry — skip permanently
+            await Promise.all([
+                supabase.from('call_queue').update({
+                    status: 'failed', attempt_count: 4, last_error: err.message, updated_at: new Date()
+                }).eq('id', id),
+                campaign_id && supabase.from('campaign_leads').update({
+                    status: 'skipped', skip_reason: err.message.toLowerCase(), updated_at: new Date()
+                }).match({ campaign_id, lead_id })
+            ].filter(Boolean));
+            logger.warn('Terminal error — lead skipped', { queueId: id, lead_id, reason: err.message });
+            return;
+        }
 
         const isInsufficientFunds = err.message === 'INSUFFICIENT_FUNDS';
         const retryDelayMs = isInsufficientFunds ? 5 * 60 * 1000 : (attempt_count + 1) * 30 * 60 * 1000;
@@ -153,8 +192,17 @@ async function cleanupStuckCalls() {
         .update({ status: 'queued', updated_at: new Date() })
         .eq('status', 'processing')
         .lt('updated_at', timeout)
-        .select('id');
-    if (data?.length) logger.warn('Stuck calls reset', { count: data.length });
+        .select('id, campaign_id, lead_id');
+
+    if (data?.length) {
+        logger.warn('Stuck calls reset', { count: data.length });
+        // Also reset campaign_leads stuck in 'calling' state
+        const stuckThreshold = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+        await supabase.from('campaign_leads')
+            .update({ status: 'queued', updated_at: new Date() })
+            .eq('status', 'calling')
+            .lt('last_call_attempt_at', stuckThreshold);
+    }
 }
 
 setInterval(processQueue, POLL_INTERVAL_MS);

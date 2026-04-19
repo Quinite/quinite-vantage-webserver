@@ -18,10 +18,7 @@ export async function logCallStart(lead, campaign, callSid) {
 
     const logId = data?.id;
     if (logId) {
-        await Promise.all([
-            supabase.from('leads').update({ call_log_id: logId }).eq('id', lead.id),
-            supabase.rpc('increment_campaign_stat', { campaign_uuid: campaign.id, stat_name: 'total_calls' })
-        ]);
+        await supabase.rpc('increment_campaign_stat', { campaign_uuid: campaign.id, stat_name: 'total_calls' });
     }
     return logId;
 }
@@ -50,16 +47,41 @@ export async function finalizeCallOutcome(callLogId, leadId, campaignId, transcr
             await supabase.rpc('deduct_call_credits', { org_id: organizationId, deduction: callCost });
         }
 
+        // Update campaign_leads: mark call as completed
+        if (campaignId && leadId) {
+            const finalCampaignLeadStatus = durationSecs > 0 ? 'called' : 'failed';
+            await supabase.from('campaign_leads').update({
+                status: finalCampaignLeadStatus,
+                call_log_id: callLogId,
+                last_call_attempt_at: endedAt,
+                updated_at: endedAt
+            }).match({ campaign_id: campaignId, lead_id: leadId });
+        }
+
+        // Increment campaign credit_spent and auto-pause if cap exceeded
+        if (callCost > 0 && campaignId) {
+            const { data: newSpent } = await supabase.rpc('increment_campaign_credit_spent', {
+                p_campaign_id: campaignId,
+                p_amount: callCost
+            });
+            if (newSpent != null) {
+                const { data: camp } = await supabase.from('campaigns')
+                    .select('credit_cap, status').eq('id', campaignId).single();
+                if (camp?.credit_cap && newSpent >= camp.credit_cap && camp.status === 'running') {
+                    await supabase.from('campaigns')
+                        .update({ status: 'paused', paused_at: endedAt, updated_at: endedAt })
+                        .eq('id', campaignId);
+                    logger.warn('Campaign auto-paused: credit cap reached', { campaignId, credit_spent: newSpent, credit_cap: camp.credit_cap });
+                }
+            }
+        }
+
         if (durationSecs > 0) {
             await supabase.rpc('increment_campaign_stat', { campaign_uuid: campaignId, stat_name: 'answered_calls' });
         }
 
-        // Update lead's last_contacted_at and increment total_calls
-        const { data: leadData } = await supabase.from('leads').select('total_calls, assigned_to').eq('id', leadId).single();
-        await supabase.from('leads').update({
-            last_contacted_at: endedAt,
-            total_calls: (leadData?.total_calls || 0) + 1
-        }).eq('id', leadId);
+        // Get lead assigned_to for WhatsApp task creation
+        const { data: leadData } = await supabase.from('leads').select('assigned_to').eq('id', leadId).single();
 
         // Get final call_status (may have been set to 'transferred' etc. by a tool)
         const { data: finalLog } = await supabase.from('call_logs')
