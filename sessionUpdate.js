@@ -25,6 +25,38 @@ export const createSessionUpdate = (context, campaign, otherProjects = []) => {
     const firstName = lead.name?.split(' ')[0] || '';
     const orgName = campaign?.organization?.name || 'hamari company';
 
+    const knownPrefs = [];
+    
+    // Combine Property Type details (e.g. "2BHK Villa residential")
+    const propDetails = [lead.preferred_configuration, lead.preferred_property_type, lead.preferred_category]
+        .filter(Boolean).join(' ');
+    
+    if (propDetails) knownPrefs.push(`Looking for: ${propDetails}`);
+    if (lead.preferred_transaction_type) knownPrefs.push(`Transaction: Wants to ${lead.preferred_transaction_type}`);
+    if (lead.preferred_location) knownPrefs.push(`Preferred Area: ${lead.preferred_location}`);
+    const formatMoney = (val) => {
+        const num = Number(val);
+        if (isNaN(num) || !val) return val;
+        if (num >= 10000000) return `₹${+(num / 10000000).toFixed(2)}Cr`;
+        if (num >= 100000) return `₹${+(num / 100000).toFixed(2)}L`;
+        if (num >= 1000) return `₹${+(num / 1000).toFixed(1)}K`;
+        return `₹${num}`;
+    };
+
+    if (lead.budget_range || (lead.min_budget && lead.max_budget)) {
+        const bdg = lead.budget_range || `${formatMoney(lead.min_budget)} to ${formatMoney(lead.max_budget)}`;
+        knownPrefs.push(`Budget: ${bdg}`);
+    }
+    if (lead.preferred_timeline) knownPrefs.push(`Moving Timeline: ${lead.preferred_timeline}`);
+
+    const prefsText = knownPrefs.length > 0 
+        ? `\n\n# KNOWN LEAD PREFERENCES (DO NOT ASK FOR THESE AGAIN)\n${knownPrefs.join('\n')}\nSince you already know these details, DO NOT ask them what type of house they are looking for or what their budget is. Instead, acknowledge it naturally and smoothly move to pitching suitable options.`
+        : '';
+
+    const qualifyInstruction = knownPrefs.length > 0
+        ? `2. QUALIFY gently — You already know their preferences. Acknowledge what they are looking for (e.g. "To aap ${lead.preferred_configuration || 'property'} dekh rahe the ${lead.preferred_location || ''} mein...") and ask if they are still looking or have found something.`
+        : `2. QUALIFY gently — Ask ONE question at a time:\n   - "Kaunse type ka ghar dekhna hai aapko? 2BHK, 3BHK?"\n   - Then budget: "Budget range kya hai aapka roughly?"\n   - Then timeline/preference based on their answers`;
+
     const systemInstructions = `
 # WHO YOU ARE
 You are Riya — a friendly, sharp Sales Consultant at ${orgName}.
@@ -55,14 +87,11 @@ After greeting, PAUSE and let them respond before asking anything else.
 Project: ${project.name || 'Our Project'}
 Status: ${project.construction_status || 'Under Development'}
 Possession: ${project.possession_date || 'Ask team for details'}
-Location: ${project.location || project.address || ''}
+Location: ${project.location || project.address || ''}${prefsText}
 
 # YOUR CONVERSATION FLOW
 1. GREET warmly (see above). Wait for response.
-2. QUALIFY gently — Ask ONE question at a time:
-   - "Kaunse type ka ghar dekhna hai aapko? 2BHK, 3BHK?"
-   - Then budget: "Budget range kya hai aapka roughly?"
-   - Then timeline/preference based on their answers
+${qualifyInstruction}
 3. CHECK INVENTORY — Call check_detailed_inventory with their preferences. Share 2-3 best options naturally:
    - "Acha suniye, ek 2BHK mil raha hai Tower A mein, 3rd floor, north facing — 75 lakh ka. Kaafi accha unit hai."
 4. If the tool returns a note field (like "exact match nahi mila"), acknowledge honestly:
