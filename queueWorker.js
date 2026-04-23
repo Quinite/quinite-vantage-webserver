@@ -1,6 +1,7 @@
 import { supabase } from './services/supabase.js';
 import { plivoClient } from './services/plivo.js';
 import { logger } from './src/lib/logger.js';
+import { hasAvailableCredits } from './src/lib/callLifecycle.js';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -85,10 +86,25 @@ async function executeCall(item) {
         }
     }
 
-    const credits = campaign?.organization?.call_credits;
-    const balance = credits ? parseFloat(credits.balance ?? credits[0]?.balance ?? 0) : 0;
-
     try {
+        // Pre-call credit check: verify org has combined monthly + purchased credits > 0
+        const orgId = organization_id || campaign?.organization_id;
+        if (orgId) {
+            const creditsAvailable = await hasAvailableCredits(orgId);
+            if (!creditsAvailable) {
+                logger.warn('Pre-call credit check failed — skipping lead', { queueId: id, lead_id, campaign_id, orgId });
+                await Promise.all([
+                    supabase.from('call_queue').update({
+                        status: 'failed', attempt_count: 4, last_error: 'NO_CREDITS', updated_at: new Date()
+                    }).eq('id', id),
+                    campaign_id && supabase.from('campaign_leads').update({
+                        status: 'skipped', skip_reason: 'skipped_no_credits', updated_at: new Date()
+                    }).match({ campaign_id, lead_id })
+                ].filter(Boolean));
+                return;
+            }
+        }
+
         // Atomic lock — prevents double-calling
         const { data: lockedItem, error: lockError } = await supabase
             .from('call_queue')
@@ -98,8 +114,6 @@ async function executeCall(item) {
             .single();
 
         if (lockError || !lockedItem) return;
-
-        if (balance < 0.2) throw new Error('INSUFFICIENT_FUNDS');
 
         const { data: leadContext } = await supabase
             .from('leads')

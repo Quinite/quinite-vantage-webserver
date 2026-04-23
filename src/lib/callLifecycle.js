@@ -27,7 +27,7 @@ export async function finalizeCallOutcome(callLogId, leadId, campaignId, transcr
     try {
         const endedAt = new Date().toISOString();
         const durationSecs = Math.max(0, Math.round((Date.now() - callStartTime) / 1000));
-        const COST_PER_MINUTE = parseFloat(process.env.CALL_COST_PER_MINUTE || '0.50');
+        const COST_PER_MINUTE = parseFloat(process.env.CALL_COST_PER_MINUTE || '1.0');
         const callCost = parseFloat(((durationSecs / 60) * COST_PER_MINUTE).toFixed(4));
 
         // Set completed status only if still in_progress; preserve transferred/abusive terminal states
@@ -45,6 +45,29 @@ export async function finalizeCallOutcome(callLogId, leadId, campaignId, transcr
         // Deduct credits atomically (RPC enforces balance >= 0)
         if (callCost > 0 && organizationId) {
             await supabase.rpc('deduct_call_credits', { org_id: organizationId, deduction: callCost });
+
+            // Auto-pause active campaigns if org credits are now fully exhausted
+            const { data: creditsAfter } = await supabase
+                .from('call_credits')
+                .select('monthly_balance, balance')
+                .eq('organization_id', organizationId)
+                .single();
+
+            if (creditsAfter && (creditsAfter.monthly_balance + creditsAfter.balance) <= 0) {
+                const { data: pausedCampaigns } = await supabase
+                    .from('campaigns')
+                    .update({ status: 'paused', paused_at: endedAt, updated_at: endedAt })
+                    .eq('organization_id', organizationId)
+                    .in('status', ['active', 'running'])
+                    .select('id');
+                if (pausedCampaigns?.length) {
+                    logger.warn('Campaigns auto-paused: org credits exhausted', {
+                        organizationId,
+                        pausedCount: pausedCampaigns.length,
+                        campaignIds: pausedCampaigns.map(c => c.id)
+                    });
+                }
+            }
         }
 
         // Update campaign_leads: mark call as completed
@@ -122,4 +145,16 @@ export async function finalizeCallOutcome(callLogId, leadId, campaignId, transcr
     } catch (err) {
         logger.error('finalizeCallOutcome failed', { callSid, error: err.message });
     }
+}
+
+// Check total available credits (monthly + purchased) before initiating a call
+export async function hasAvailableCredits(organizationId, supabaseClient = supabase) {
+    const { data } = await supabaseClient
+        .from('call_credits')
+        .select('monthly_balance, balance')
+        .eq('organization_id', organizationId)
+        .single();
+
+    if (!data) return false;
+    return (data.monthly_balance + data.balance) > 0;
 }
