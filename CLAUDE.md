@@ -171,7 +171,7 @@ quinite-vantage-webserver/
 | `unit_configs` / `towers` | joined for unit details |
 | `profiles` | find agents for transfer |
 | `lead_interactions` | create interaction record |
-| `lead_tasks` | create WhatsApp brochure task |
+| `tasks` | create WhatsApp brochure task |
 
 **RPC functions called:**
 - `update_campaign_sentiment(campaign_uuid, new_score)`

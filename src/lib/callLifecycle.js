@@ -126,7 +126,7 @@ export async function finalizeCallOutcome(callLogId, leadId, campaignId, transcr
 
         // Create WhatsApp brochure task if lead requested it during the call
         if (finalLog?.ai_metadata?.whatsapp_brochure_requested && leadData?.assigned_to) {
-            await supabase.from('lead_tasks').insert({
+            await supabase.from('tasks').insert({
                 lead_id: leadId,
                 organization_id: organizationId,
                 title: 'Send project brochure via WhatsApp',
