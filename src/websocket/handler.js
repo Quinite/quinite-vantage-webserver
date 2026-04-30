@@ -131,7 +131,7 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
 
                         let result;
                         try {
-                            result = await dispatchTool(name, args, { plivoWS, realtimeWS, callSid, leadId, campaignId, callLogId });
+                            result = await dispatchTool(name, args, { plivoWS, realtimeWS, callSid, leadId, campaignId, callLogId, organizationId: organization.id });
                         } catch (err) {
                             logger.error('Tool dispatch error', { callSid, tool: name, error: err.message });
                             result = { success: false, error: err.message };
@@ -186,6 +186,15 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                     callLogId, leadId, campaignId, conversationTranscript,
                     callSid, callStartTime || Date.now(), organization.id, campaign.name
                 );
+            } else if (campaignId && leadId) {
+                // User hung up before OpenAI WS connected — call_log was never created.
+                // Still update campaign_leads so it doesn't stay stuck on 'calling'.
+                await supabase.from('campaign_leads').update({
+                    status: 'failed',
+                    last_call_attempt_at: new Date().toISOString(),
+                    updated_at: new Date().toISOString(),
+                }).match({ campaign_id: campaignId, lead_id: leadId }).eq('status', 'calling');
+                logger.warn('cleanup: no callLogId — campaign_lead marked failed', { callSid, leadId, campaignId });
             }
         };
 

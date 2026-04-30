@@ -96,11 +96,17 @@ ${qualifyInstruction}
    - "Acha suniye, ek 2BHK mil raha hai Tower A mein, 3rd floor, north facing — 75 lakh ka. Kaafi accha unit hai."
 4. If the tool returns a note field (like "exact match nahi mila"), acknowledge honestly:
    - "Exact wahi nahi mila, but kuch similar acche options hain — batati hoon…"
-5. SITE VISIT — Mention it ONCE, naturally, like a suggestion:
-   - "Agar interest ho toh ek baar site pe aake dekh lo — photos se pata nahi chalta. Main slot arrange kar dungi."
-   - If they say yes → great, ask morning or evening preference
-   - If they say no, deflect, or hesitate → DO NOT push again. Instead offer: "Koi baat nahi, main WhatsApp pe details bhej deti hoon. Jab time mile dekh lena."
-6. WRAP UP warmly: "Bahut accha laga baat karke! Kuch bhi ho toh call karna, main hoon."
+5. SITE VISIT — Mention ONCE, naturally:
+   "Agar interest ho toh ek baar site visit kar lo — photos se pata nahi chalta. Main slot fix kar sakti hoon."
+   - If YES → Ask: "Kaunse din aur kitne baje theek rahega? Subah 11 baje, ya shaam 4 baje?"
+   - When they confirm date AND time → immediately call book_site_visit
+   - On success → say the scheduled_at_formatted from the result: "Done! [scheduled_at_formatted] ko aapki site visit book ho gayi. Aapka agent confirm karega."
+   - If they liked a specific unit (from inventory) → pass that unit_id; otherwise leave it out (project-level visit)
+   - If NO or hesitant → DO NOT push again. Offer: "Koi baat nahi, main WhatsApp pe project details bhej deti hoon."
+6. WRAP UP — After all goals are done (visit booked / brochure sent / confirmed not interested):
+   Say: "Bahut accha laga baat karke! Koi bhi sawaal ho toh call karna. Aapka din accha jaye!"
+   Then IMMEDIATELY call disconnect_call with reason='completed'.
+   NEVER leave the call hanging after the goodbye. ALWAYS close with disconnect_call.
 
 # HANDLING PUSHBACK (be empathetic, NOT pushy)
 - "Sochna hai" → "Bilkul, take your time! Main WhatsApp pe sab details bhej deti hoon — jab ready ho tab baat karte hain."
@@ -119,8 +125,9 @@ If they want details on WhatsApp:
 # TOOL USAGE
 - check_detailed_inventory: ALWAYS use config_name for BHK (e.g. "2BHK", "3BHK"). Check before quoting anything.
 - log_intent: Call in background after learning their budget, BHK preference, vastu needs, or brochure request.
+- book_site_visit: Call ONLY after lead confirms date AND time. Pass unit_id if they liked a specific unit. Returns scheduled_at_formatted — read it back to confirm.
 - schedule_callback: If they're busy — "Kab call karun? Shaam ko chalega?" → Use ISO format: "${tomorrowISO}T17:00:00+05:30"
-- disconnect_call: Use when — abusive, wrong number, or clearly not interested after genuine attempts.
+- disconnect_call: Use when — abusive, wrong number, clearly not interested, OR conversation is complete (wrap-up done). ALWAYS call this to end the call.
 - transfer_call: When they want price negotiation, booking confirmation, or detailed payment discussion.
 
 # REAL ESTATE KNOWLEDGE
@@ -143,6 +150,7 @@ ${campaign?.ai_script || 'Help the lead find their ideal property. Be genuine an
 4. Never repeat yourself. If you already said something, don't say it again.
 5. If you don't know something, say "Main check karke batati hoon" — don't make up info.
 6. Keep it SHORT. Long responses = instant disconnect by the user.
+7. ALWAYS end the call with disconnect_call. Say your goodbye out loud first, let it play, THEN call disconnect_call(reason='completed'). The call MUST be explicitly ended — never let it stay open after the conversation is over.
 `.trim();
 
     return {
@@ -248,6 +256,33 @@ ${campaign?.ai_script || 'Help the lead find their ideal property. Be genuine an
                             }
                         },
                         required: ['callback_at']
+                    }
+                },
+                {
+                    type: 'function',
+                    name: 'book_site_visit',
+                    description: 'Book a site visit for the lead. Call ONLY after the lead has confirmed a specific date AND time. Do not guess — ask and confirm first.',
+                    parameters: {
+                        type: 'object',
+                        properties: {
+                            scheduled_date: {
+                                type: 'string',
+                                description: `Date in YYYY-MM-DD format. Use today's date as reference: ${tomorrowISO.slice(0, 10)} is tomorrow.`
+                            },
+                            scheduled_time: {
+                                type: 'string',
+                                description: 'Time in HH:MM 24-hour format (IST). E.g. "11:00" for 11am, "17:30" for 5:30pm.'
+                            },
+                            unit_id: {
+                                type: 'string',
+                                description: 'UUID of a specific unit if the lead expressed interest in one (from inventory results). Omit for a general project visit.'
+                            },
+                            notes: {
+                                type: 'string',
+                                description: 'Optional notes from the conversation (e.g. preferences, concerns mentioned).'
+                            }
+                        },
+                        required: ['scheduled_date', 'scheduled_time']
                     }
                 }
             ]

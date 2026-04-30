@@ -4,7 +4,7 @@ import { analyzeSentiment } from '../../services/sentimentService.js';
 import { logger } from './logger.js';
 
 export async function logCallStart(lead, campaign, callSid) {
-    const { data } = await supabase.from('call_logs').insert({
+    const { data, error } = await supabase.from('call_logs').insert({
         organization_id: campaign.organization_id,
         project_id: campaign.project_id,
         campaign_id: campaign.id,
@@ -15,6 +15,10 @@ export async function logCallStart(lead, campaign, callSid) {
         caller_number: getCallerId(campaign),
         callee_number: lead.phone
     }).select('id').single();
+
+    if (error) {
+        logger.error('logCallStart insert failed', { callSid, leadId: lead.id, campaignId: campaign.id, error: error.message });
+    }
 
     const logId = data?.id;
     if (logId) {
@@ -103,8 +107,8 @@ export async function finalizeCallOutcome(callLogId, leadId, campaignId, transcr
             await supabase.rpc('increment_campaign_stat', { campaign_uuid: campaignId, stat_name: 'answered_calls' });
         }
 
-        // Get lead assigned_to for WhatsApp task creation
-        const { data: leadData } = await supabase.from('leads').select('assigned_to').eq('id', leadId).single();
+        // Get lead assigned_to and project_id for WhatsApp task creation
+        const { data: leadData } = await supabase.from('leads').select('assigned_to, project_id').eq('id', leadId).single();
 
         // Get final call_status (may have been set to 'transferred' etc. by a tool)
         const { data: finalLog } = await supabase.from('call_logs')
@@ -129,12 +133,14 @@ export async function finalizeCallOutcome(callLogId, leadId, campaignId, transcr
             await supabase.from('tasks').insert({
                 lead_id: leadId,
                 organization_id: organizationId,
+                project_id: leadData.project_id || null,
                 title: 'Send project brochure via WhatsApp',
-                description: `Lead requested brochure during AI call. Campaign ID: ${campaignId}`,
+                description: `Lead requested brochure during AI call. Campaign: ${campaignName || campaignId}`,
                 assigned_to: leadData.assigned_to,
+                created_by: leadData.assigned_to,
                 priority: 'medium',
                 status: 'pending',
-                due_date: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString()
+                due_date: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString().slice(0, 10),
             });
             logger.info('WhatsApp brochure task created', { callSid, leadId });
         }

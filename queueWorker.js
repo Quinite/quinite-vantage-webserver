@@ -136,12 +136,15 @@ async function executeCall(item) {
 
         const answerUrl = `${process.env.WEBSOCKET_SERVER_URL}/answer?leadId=${lead_id}&campaignId=${campaign_id}`;
         const recordingCallbackUrl = `${process.env.WEBSOCKET_SERVER_URL}/recording`;
+        const hangupUrl = `${process.env.WEBSOCKET_SERVER_URL}/status?leadId=${lead_id}&campaignId=${campaign_id}`;
         const response = await plivoClient.calls.create(fromNumber, formattedTo, answerUrl, {
             answer_method: 'POST',
             time_limit: 1800,
             record: 'true',
             record_callback_url: recordingCallbackUrl,
             record_callback_method: 'POST',
+            hangup_url: hangupUrl,
+            hangup_method: 'POST',
         });
 
         const callSid = response.requestUuid || response.callUuid;

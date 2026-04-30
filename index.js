@@ -4,6 +4,7 @@ import WebSocket, { WebSocketServer } from 'ws';
 import dotenv from 'dotenv';
 import answerRouter from './src/routes/answer.js';
 import recordingRouter from './src/routes/recording.js';
+import statusRouter from './src/routes/status.js';
 import { startRealtimeWSConnection } from './src/websocket/handler.js';
 import { logger } from './src/lib/logger.js';
 
@@ -21,6 +22,7 @@ const PORT = parseInt(process.env.PORT) || 10000;
 app.get(['/', '/health'], (req, res) => res.send('OK'));
 app.use('/answer', answerRouter);
 app.use('/recording', recordingRouter);
+app.use('/status', statusRouter);
 // Returns Plivo XML to dial a target number (used for human transfer)
 app.get('/transfer-xml', (req, res) => {
     const { target } = req.query;
