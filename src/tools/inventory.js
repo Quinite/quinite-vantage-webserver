@@ -12,12 +12,13 @@ export async function handleDetailedInventory(leadId, args) {
 
     // Fetch units with joins — do NOT filter on joined table columns via SDK (unreliable).
     // Apply joined-table filters (category, property_type, config_name, carpet_area) in JS after fetch.
+    // price_undisclosed: unit-level flag overrides config-level flag (unit wins if set)
     let query = supabase.from('units').select(`
-        id, unit_number, floor_number, facing, total_price, base_price,
+        id, unit_number, floor_number, facing, total_price, base_price, price_undisclosed,
         bedrooms, bathrooms, balconies, is_corner, is_vastu_compliant,
         possession_date, construction_status, transaction_type, status,
         tower:towers(name, total_floors),
-        config:unit_configs(config_name, category, property_type, carpet_area, built_up_area, super_built_up_area, plot_area)
+        config:unit_configs(config_name, category, property_type, carpet_area, built_up_area, super_built_up_area, plot_area, price_undisclosed)
     `)
         .eq('project_id', lead.project_id)
         .eq('status', 'available')
@@ -47,11 +48,11 @@ export async function handleDetailedInventory(leadId, args) {
     if (!units?.length) {
         logger.warn('Inventory: zero results with filters, trying broad query', { leadId, projectId: lead.project_id, args });
         const { data: broadUnits } = await supabase.from('units').select(`
-            id, unit_number, floor_number, facing, total_price, base_price,
+            id, unit_number, floor_number, facing, total_price, base_price, price_undisclosed,
             bedrooms, bathrooms, balconies, is_corner, is_vastu_compliant,
             possession_date, construction_status, transaction_type, status,
             tower:towers(name, total_floors),
-            config:unit_configs(config_name, category, property_type, carpet_area, built_up_area, super_built_up_area, plot_area)
+            config:unit_configs(config_name, category, property_type, carpet_area, built_up_area, super_built_up_area, plot_area, price_undisclosed)
         `)
             .eq('project_id', lead.project_id)
             .eq('status', 'available')
@@ -115,6 +116,7 @@ export async function handleDetailedInventory(leadId, args) {
 }
 
 function formatUnit(u) {
+    const priceHidden = u.price_undisclosed || u.config?.price_undisclosed || false;
     return {
         unit_id: u.id,
         unit_no: u.unit_number,
@@ -133,7 +135,7 @@ function formatUnit(u) {
             super_built: u.config?.super_built_up_area,
             plot: u.config?.plot_area
         },
-        price: u.total_price || u.base_price,
+        price: priceHidden ? 'PRICE_UNDISCLOSED' : (u.total_price || u.base_price),
         facing: u.facing,
         vastu: u.is_vastu_compliant ? 'Yes' : 'No',
         corner_unit: u.is_corner ? 'Yes' : 'No',
