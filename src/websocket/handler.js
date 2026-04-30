@@ -11,27 +11,11 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, callSid) {
     try {
-        const realtimeWS = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview', {
-            headers: {
-                'Authorization': `Bearer ${OPENAI_API_KEY}`,
-                'OpenAI-Beta': 'realtime=v1'
-            }
-        });
+        logger.info('Fetching call context', { callSid, leadId, campaignId });
 
-        realtimeWS.on('error', (err) => {
-            logger.error('OpenAI WS error', { callSid, error: err.message });
-        });
-
-        const startupTimeout = setTimeout(async () => {
-            if (realtimeWS.readyState !== WebSocket.OPEN) {
-                logger.error('OpenAI connect timeout', { callSid });
-                realtimeWS.terminate();
-                try { await plivoClient.calls.hangup(callSid); } catch (_) {}
-                plivoWS.close();
-            }
-        }, 10000);
-
-        // Fetch lead and campaign in parallel
+        // Fetch lead and campaign BEFORE creating the OpenAI WS.
+        // If we created the WS first and then awaited DB queries, the 'open' event
+        // could fire while we're still awaiting — before the handler is registered — and be lost.
         const [{ data: context, error: contextError }, { data: campaignData }] = await Promise.all([
             supabase.from('leads').select('*, project:projects(*)').eq('id', leadId).single(),
             supabase.from('campaigns').select('*, organization:organizations!inner(id, name, caller_id, subscription_status, call_credits(*))').eq('id', campaignId).single()
@@ -39,8 +23,8 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
 
         if (contextError || !context || !campaignData) {
             logger.error('Context fetch failed', { callSid, error: contextError?.message });
-            clearTimeout(startupTimeout);
-            realtimeWS.close();
+            try { await plivoClient.calls.hangup(callSid); } catch (_) {}
+            plivoWS.close();
             return null;
         }
 
@@ -50,35 +34,91 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
         const balance = Array.isArray(credits) ? parseFloat(credits[0]?.balance || 0) : parseFloat(credits?.balance || 0);
 
         if (!['active', 'running'].includes(campaign.status) || (context.project && context.project.archived_at)) {
-            logger.warn('Campaign or project inactive', { callSid, status: campaign.status });
-            clearTimeout(startupTimeout);
-            realtimeWS.close();
+            logger.warn('Campaign or project inactive — rejecting call', { callSid, status: campaign.status });
+            try { await plivoClient.calls.hangup(callSid); } catch (_) {}
+            plivoWS.close();
             return null;
         }
 
         if (!['active', 'trialing'].includes(organization.subscription_status) || balance < 0.5) {
-            logger.warn('Credits exhausted or subscription inactive', { callSid, balance, subStatus: organization.subscription_status });
-            clearTimeout(startupTimeout);
-            realtimeWS.close();
+            logger.warn('Credits exhausted or subscription inactive — rejecting call', { callSid, balance, subStatus: organization.subscription_status });
+            try { await plivoClient.calls.hangup(callSid); } catch (_) {}
+            plivoWS.close();
             return null;
         }
+
+        logger.info('Context ready — opening OpenAI WS', { callSid, leadName: context.name, campaignId });
+
+        // All validation passed. Now create the OpenAI WS. All handlers are registered
+        // synchronously before yielding, so no event can fire before we're ready.
+        const realtimeWS = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview', {
+            headers: {
+                'Authorization': `Bearer ${OPENAI_API_KEY}`,
+                'OpenAI-Beta': 'realtime=v1'
+            }
+        });
 
         let conversationTranscript = '';
         let callLogId = null;
         let callStartTime = null;
         let silenceTimer = null;
         let cleanupCalled = false;
+        let keepalive = null;
 
         const silenceTimeoutMs = (campaign.call_settings?.silence_timeout || 15) * 1000;
+
+        // If OpenAI WS doesn't open within 12s, hang up
+        const startupTimeout = setTimeout(async () => {
+            if (realtimeWS.readyState !== WebSocket.OPEN) {
+                logger.error('OpenAI connect timeout — hanging up', { callSid });
+                realtimeWS.terminate();
+                try { await plivoClient.calls.hangup(callSid); } catch (_) {}
+                plivoWS.close();
+            }
+        }, 12000);
 
         const resetSilenceTimer = () => {
             if (silenceTimer) clearTimeout(silenceTimer);
             silenceTimer = setTimeout(async () => {
-                logger.info('Silence timeout', { callSid, timeoutSec: silenceTimeoutMs / 1000 });
+                logger.info('Silence timeout — disconnecting', { callSid, timeoutSec: silenceTimeoutMs / 1000 });
                 const { handleDisconnect } = await import('../tools/disconnect.js');
                 await handleDisconnect(plivoWS, realtimeWS, callSid, leadId, { reason: 'silence' }, callLogId);
             }, silenceTimeoutMs);
         };
+
+        const cleanup = async () => {
+            if (cleanupCalled) return;
+            cleanupCalled = true;
+            clearTimeout(startupTimeout);
+            if (silenceTimer) clearTimeout(silenceTimer);
+            if (keepalive) clearInterval(keepalive);
+            if (realtimeWS.readyState === WebSocket.OPEN) realtimeWS.close();
+
+            if (callLogId) {
+                await finalizeCallOutcome(
+                    callLogId, leadId, campaignId, conversationTranscript,
+                    callSid, callStartTime || Date.now(), organization.id, campaign.name
+                );
+            } else if (campaignId && leadId) {
+                // Call ended before call_log was created (user hung up very early or OpenAI failed).
+                // Still unblock campaign_leads so it doesn't stay stuck on 'calling'.
+                await supabase.from('campaign_leads').update({
+                    status: 'failed',
+                    last_call_attempt_at: new Date().toISOString(),
+                    updated_at: new Date().toISOString(),
+                }).match({ campaign_id: campaignId, lead_id: leadId }).eq('status', 'calling');
+                logger.warn('cleanup: no callLogId — campaign_lead marked failed', { callSid, leadId, campaignId });
+            }
+        };
+
+        // Wire cleanup to both sides before anything can close them
+        plivoWS.on('close', cleanup);
+        realtimeWS.on('close', cleanup);
+
+        realtimeWS.on('error', (err) => {
+            logger.error('OpenAI WS error', { callSid, error: err.message });
+            // error always precedes close, so cleanup will run via the 'close' handler
+        });
 
         realtimeWS.on('open', async () => {
             try {
@@ -92,6 +132,12 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                 callLogId = await logCallStart(context, campaign, callSid);
                 callStartTime = Date.now();
                 resetSilenceTimer();
+
+                // Prevent idle connection drops on cloud proxies
+                keepalive = setInterval(() => {
+                    if (realtimeWS.readyState === WebSocket.OPEN) realtimeWS.ping();
+                    else clearInterval(keepalive);
+                }, 25000);
             } catch (err) {
                 logger.error('Open handler crash', { callSid, error: err.message });
                 realtimeWS.close();
@@ -99,12 +145,6 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                 plivoWS.close();
             }
         });
-
-        // Prevent idle connection drops on cloud proxies
-        const keepalive = setInterval(() => {
-            if (realtimeWS.readyState === WebSocket.OPEN) realtimeWS.ping();
-            else clearInterval(keepalive);
-        }, 25000);
 
         realtimeWS.on('pong', () => {});
 
@@ -168,43 +208,21 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                     case 'response.audio_transcript.done':
                         conversationTranscript += `AI: ${response.transcript}\n`;
                         break;
+
+                    case 'error':
+                        logger.error('OpenAI Realtime API error event', { callSid, error: response.error });
+                        break;
                 }
             } catch (err) {
                 logger.error('WS message handler error', { callSid, error: err.message });
             }
         });
 
-        const cleanup = async () => {
-            if (cleanupCalled) return;
-            cleanupCalled = true;
-            clearTimeout(startupTimeout);
-            if (silenceTimer) clearTimeout(silenceTimer);
-            clearInterval(keepalive);
-            if (realtimeWS.readyState === WebSocket.OPEN) realtimeWS.close();
-            if (callLogId) {
-                await finalizeCallOutcome(
-                    callLogId, leadId, campaignId, conversationTranscript,
-                    callSid, callStartTime || Date.now(), organization.id, campaign.name
-                );
-            } else if (campaignId && leadId) {
-                // User hung up before OpenAI WS connected — call_log was never created.
-                // Still update campaign_leads so it doesn't stay stuck on 'calling'.
-                await supabase.from('campaign_leads').update({
-                    status: 'failed',
-                    last_call_attempt_at: new Date().toISOString(),
-                    updated_at: new Date().toISOString(),
-                }).match({ campaign_id: campaignId, lead_id: leadId }).eq('status', 'calling');
-                logger.warn('cleanup: no callLogId — campaign_lead marked failed', { callSid, leadId, campaignId });
-            }
-        };
-
-        plivoWS.on('close', cleanup);
-        realtimeWS.on('close', cleanup);
-
         return realtimeWS;
 
     } catch (err) {
         logger.error('startRealtimeWSConnection crash', { callSid, error: err.message, stack: err.stack });
+        try { await plivoClient.calls.hangup(callSid); } catch (_) {}
         plivoWS.close();
         return null;
     }
