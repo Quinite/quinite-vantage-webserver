@@ -49,11 +49,11 @@ export async function finalizeCallOutcome(callLogId, leadId, campaignId, transcr
             // Auto-pause active campaigns if org credits are now fully exhausted
             const { data: creditsAfter } = await supabase
                 .from('call_credits')
-                .select('monthly_balance, balance')
+                .select('balance')
                 .eq('organization_id', organizationId)
                 .single();
 
-            if (creditsAfter && (creditsAfter.monthly_balance + creditsAfter.balance) <= 0) {
+            if (creditsAfter && creditsAfter.balance <= 0) {
                 const { data: pausedCampaigns } = await supabase
                     .from('campaigns')
                     .update({ status: 'paused', paused_at: endedAt, updated_at: endedAt })
@@ -147,14 +147,14 @@ export async function finalizeCallOutcome(callLogId, leadId, campaignId, transcr
     }
 }
 
-// Check total available credits (monthly + purchased) before initiating a call
+// Check available credits before initiating a call
 export async function hasAvailableCredits(organizationId, supabaseClient = supabase) {
     const { data } = await supabaseClient
         .from('call_credits')
-        .select('monthly_balance, balance')
+        .select('balance')
         .eq('organization_id', organizationId)
         .single();
 
     if (!data) return false;
-    return (data.monthly_balance + data.balance) > 0;
+    return data.balance > 0;
 }
