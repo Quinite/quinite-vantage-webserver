@@ -26,7 +26,7 @@ export async function logCallStart(lead, campaign, callSid) {
     return data?.id ?? null;
 }
 
-export async function finalizeCallOutcome(callLogId, leadId, campaignId, transcript, callSid, callStartTime, organizationId, campaignName) {
+export async function finalizeCallOutcome(callLogId, leadId, campaignId, transcript, callSid, callStartTime, organizationId, campaignName, realtimeUsage = {}) {
     try {
         const endedAt = new Date().toISOString();
         const durationSecs = Math.max(0, Math.round((Date.now() - callStartTime) / 1000));
@@ -44,15 +44,41 @@ export async function finalizeCallOutcome(callLogId, leadId, campaignId, transcr
             return;
         }
 
+        // gpt-4o-mini-realtime-preview pricing per 1M tokens (USD), as of May 2026
+        const R = {
+            input_text_per_1m:   0.60,
+            input_audio_per_1m:  10.00,
+            output_text_per_1m:  2.40,
+            output_audio_per_1m: 20.00,
+        };
+        const realtimeCostUsd = parseFloat((
+            (realtimeUsage.input_text_tokens   || 0) / 1_000_000 * R.input_text_per_1m  +
+            (realtimeUsage.input_audio_tokens  || 0) / 1_000_000 * R.input_audio_per_1m +
+            (realtimeUsage.output_text_tokens  || 0) / 1_000_000 * R.output_text_per_1m +
+            (realtimeUsage.output_audio_tokens || 0) / 1_000_000 * R.output_audio_per_1m
+        ).toFixed(6));
+
+        const usageTelemetry = {
+            openai_realtime: {
+                input_text_tokens:   realtimeUsage.input_text_tokens   || 0,
+                input_audio_tokens:  realtimeUsage.input_audio_tokens  || 0,
+                output_text_tokens:  realtimeUsage.output_text_tokens  || 0,
+                output_audio_tokens: realtimeUsage.output_audio_tokens || 0,
+                total_tokens:        realtimeUsage.total_tokens        || 0,
+                cost_usd:            realtimeCostUsd,
+            },
+            // plivo_cost_usd is written later by the /status webhook when Plivo reports TotalCost
+        };
+
         // Set completed status only if still in_progress; preserve transferred/abusive terminal states
         await supabase.from('call_logs')
-            .update({ conversation_transcript: transcript, ended_at: endedAt, duration: durationSecs, call_cost: callCost, call_status: 'completed' })
+            .update({ conversation_transcript: transcript, ended_at: endedAt, duration: durationSecs, call_cost: callCost, call_status: 'completed', usage_telemetry: usageTelemetry })
             .eq('id', callLogId)
             .eq('call_status', 'in_progress');
 
         // Always set time/cost even for non-in_progress terminal states
         await supabase.from('call_logs')
-            .update({ conversation_transcript: transcript, ended_at: endedAt, duration: durationSecs, call_cost: callCost })
+            .update({ conversation_transcript: transcript, ended_at: endedAt, duration: durationSecs, call_cost: callCost, usage_telemetry: usageTelemetry })
             .eq('id', callLogId)
             .neq('call_status', 'in_progress');
 

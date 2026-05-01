@@ -56,9 +56,18 @@ Return JSON only:
         });
 
         const analysis = JSON.parse(completion.choices[0].message.content);
+        const sentimentUsage = completion.usage || {};
 
-        // Fetch existing ai_metadata to preserve fields set during the call (e.g. interested_project_id)
-        const { data: existingLog } = await supabase.from('call_logs').select('ai_metadata').eq('id', callLogId).single();
+        // gpt-4o-mini pricing per 1M tokens (USD), as of May 2026
+        const sentimentCostUsd = parseFloat((
+            (sentimentUsage.prompt_tokens     || 0) / 1_000_000 * 0.15 +
+            (sentimentUsage.completion_tokens || 0) / 1_000_000 * 0.60
+        ).toFixed(6));
+
+        // Fetch existing ai_metadata + usage_telemetry to merge
+        const { data: existingLog } = await supabase.from('call_logs')
+            .select('ai_metadata, usage_telemetry').eq('id', callLogId).single();
+
         const mergedMeta = {
             ...(existingLog?.ai_metadata || {}),
             objections: analysis.objections,
@@ -67,11 +76,22 @@ Return JSON only:
             key_takeaways: analysis.key_takeaways,
         };
 
+        const mergedPlatformMeta = {
+            ...(existingLog?.usage_telemetry || {}),
+            sentiment_analysis: {
+                prompt_tokens:     sentimentUsage.prompt_tokens     || 0,
+                completion_tokens: sentimentUsage.completion_tokens || 0,
+                total_tokens:      sentimentUsage.total_tokens      || 0,
+                cost_usd:          sentimentCostUsd,
+            },
+        };
+
         await supabase.from('call_logs').update({
             summary: analysis.summary,
             sentiment_score: analysis.sentiment_score,
             interest_level: analysis.interest_level,
-            ai_metadata: mergedMeta
+            ai_metadata: mergedMeta,
+            usage_telemetry: mergedPlatformMeta,
         }).eq('id', callLogId);
 
         // Update lead with AI-derived behavioral signals

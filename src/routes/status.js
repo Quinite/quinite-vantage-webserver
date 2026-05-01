@@ -69,7 +69,7 @@ router.all('/', async (req, res) => {
     res.status(200).send('OK');
 
     const params = { ...req.query, ...req.body };
-    const { CallUUID, CallStatus, Duration, BillDuration, leadId, campaignId } = params;
+    const { CallUUID, CallStatus, Duration, BillDuration, TotalCost, leadId, campaignId } = params;
 
     if (!CallUUID || !CallStatus) return;
 
@@ -103,6 +103,17 @@ router.all('/', async (req, res) => {
                 .eq('call_status', 'in_progress');
 
             logger.info('status webhook: updated in_progress call_log', { callLogId: callLog.id, callStatus });
+        }
+
+        // Merge Plivo's reported cost into usage_telemetry (always, regardless of call_status)
+        if (TotalCost != null) {
+            const plivoCostUsd = parseFloat(TotalCost) || 0;
+            const { data: existing } = await supabase.from('call_logs')
+                .select('usage_telemetry').eq('id', callLog.id).single();
+            await supabase.from('call_logs')
+                .update({ usage_telemetry: { ...(existing?.usage_telemetry || {}), plivo_cost_usd: plivoCostUsd } })
+                .eq('id', callLog.id);
+            logger.info('status webhook: plivo cost recorded', { callLogId: callLog.id, plivoCostUsd });
         }
 
         // Update campaign_leads if still stuck on 'calling' (WebSocket finalize missed it)

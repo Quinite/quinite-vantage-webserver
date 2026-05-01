@@ -73,6 +73,13 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
         let keepalive = null;
         let responseActive = false; // tracks whether OpenAI has an active response in-flight
 
+        // Accumulated OpenAI Realtime token usage across all response.done events this call
+        const realtimeUsage = {
+            input_text_tokens: 0, input_audio_tokens: 0,
+            output_text_tokens: 0, output_audio_tokens: 0,
+            total_tokens: 0,
+        };
+
         const silenceTimeoutMs = (campaign.call_settings?.silence_timeout || 15) * 1000;
 
         // If OpenAI WS doesn't open within 12s, hang up
@@ -104,7 +111,8 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
 
             await finalizeCallOutcome(
                 callLogId, leadId, campaignId, conversationTranscript,
-                callSid, callStartTime || Date.now(), organization.id, campaign.name
+                callSid, callStartTime || Date.now(), organization.id, campaign.name,
+                realtimeUsage
             );
         };
 
@@ -194,6 +202,17 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                         break;
 
                     case 'response.done':
+                        responseActive = false;
+                        if (response.response?.usage) {
+                            const u = response.response.usage;
+                            realtimeUsage.input_text_tokens  += u.input_token_details?.text_tokens  || 0;
+                            realtimeUsage.input_audio_tokens += u.input_token_details?.audio_tokens || 0;
+                            realtimeUsage.output_text_tokens  += u.output_token_details?.text_tokens  || 0;
+                            realtimeUsage.output_audio_tokens += u.output_token_details?.audio_tokens || 0;
+                            realtimeUsage.total_tokens        += u.total_tokens || 0;
+                        }
+                        break;
+
                     case 'response.cancelled':
                         responseActive = false;
                         break;
