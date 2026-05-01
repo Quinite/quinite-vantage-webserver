@@ -1,14 +1,47 @@
 import { supabase } from '../../services/supabase.js';
 import { logger } from '../lib/logger.js';
 
-export async function handleDetailedInventory(leadId, args) {
-    const { data: lead } = await supabase.from('leads').select('project_id').eq('id', leadId).single();
-    if (!lead?.project_id) {
-        logger.warn('Inventory: no project_id for lead', { leadId });
+export async function handleDetailedInventory(leadId, args, context = {}) {
+    const { campaignProjectIds = [] } = context;
+    let targetProjectId = null;
+
+    // 1. Explicit project_id from AI (security: must be a campaign project)
+    if (args.project_id) {
+        if (campaignProjectIds.length > 0 && !campaignProjectIds.includes(args.project_id)) {
+            logger.warn('Inventory: AI requested project not in campaign', { leadId, requestedProjectId: args.project_id, campaignProjectIds });
+            return { success: false, error: 'That project is not part of this campaign.' };
+        }
+        targetProjectId = args.project_id;
+    }
+
+    // 2. Resolve project_name to ID (must be within campaign projects)
+    if (!targetProjectId && args.project_name && campaignProjectIds.length > 0) {
+        const { data: projectMatch } = await supabase.from('projects')
+            .select('id')
+            .in('id', campaignProjectIds)
+            .ilike('name', `%${args.project_name}%`)
+            .limit(1)
+            .single();
+        if (projectMatch) targetProjectId = projectMatch.id;
+    }
+
+    // 3. Lead's own project_id (existing behavior)
+    if (!targetProjectId) {
+        const { data: lead } = await supabase.from('leads').select('project_id').eq('id', leadId).single();
+        targetProjectId = lead?.project_id;
+    }
+
+    // 4. First campaign project fallback
+    if (!targetProjectId && campaignProjectIds.length > 0) {
+        targetProjectId = campaignProjectIds[0];
+    }
+
+    if (!targetProjectId) {
+        logger.warn('Inventory: no project_id resolved', { leadId });
         return { success: false, error: 'Project context missing.' };
     }
 
-    logger.info('Inventory lookup', { leadId, projectId: lead.project_id, filters: args });
+    logger.info('Inventory lookup', { leadId, projectId: targetProjectId, filters: args, campaignProjectIds });
 
     // Fetch units with joins — do NOT filter on joined table columns via SDK (unreliable).
     // Apply joined-table filters (category, property_type, config_name, carpet_area) in JS after fetch.
@@ -20,7 +53,7 @@ export async function handleDetailedInventory(leadId, args) {
         tower:towers(name, total_floors),
         config:unit_configs(config_name, category, property_type, carpet_area, built_up_area, super_built_up_area, plot_area, price_undisclosed)
     `)
-        .eq('project_id', lead.project_id)
+        .eq('project_id', targetProjectId)
         .eq('status', 'available')
         .eq('is_archived', false);
 
@@ -38,15 +71,15 @@ export async function handleDetailedInventory(leadId, args) {
     const { data: units, error } = await query.limit(30);
 
     if (error) {
-        logger.error('Inventory query failed', { leadId, projectId: lead.project_id, error: error.message });
+        logger.error('Inventory query failed', { leadId, projectId: targetProjectId, error: error.message });
         return { success: false, error: 'Search failed. Please try again.' };
     }
 
-    logger.info('Inventory DB result', { leadId, projectId: lead.project_id, totalFromDB: units?.length || 0, filtersApplied: Object.keys(args).length });
+    logger.info('Inventory DB result', { leadId, projectId: targetProjectId, totalFromDB: units?.length || 0, filtersApplied: Object.keys(args).length });
 
     // If filtered query returns nothing, try a broad fallback (just project + available)
     if (!units?.length) {
-        logger.warn('Inventory: zero results with filters, trying broad query', { leadId, projectId: lead.project_id, args });
+        logger.warn('Inventory: zero results with filters, trying broad query', { leadId, projectId: targetProjectId, args });
         const { data: broadUnits } = await supabase.from('units').select(`
             id, unit_number, floor_number, facing, total_price, base_price, price_undisclosed,
             bedrooms, bathrooms, balconies, is_corner, is_vastu_compliant,
@@ -54,7 +87,7 @@ export async function handleDetailedInventory(leadId, args) {
             tower:towers(name, total_floors),
             config:unit_configs(config_name, category, property_type, carpet_area, built_up_area, super_built_up_area, plot_area, price_undisclosed)
         `)
-            .eq('project_id', lead.project_id)
+            .eq('project_id', targetProjectId)
             .eq('status', 'available')
             .eq('is_archived', false)
             .limit(10);

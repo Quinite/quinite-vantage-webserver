@@ -18,7 +18,7 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
         // could fire while we're still awaiting — before the handler is registered — and be lost.
         const [{ data: context, error: contextError }, { data: campaignData }] = await Promise.all([
             supabase.from('leads').select('*, project:projects(*)').eq('id', leadId).single(),
-            supabase.from('campaigns').select('*, organization:organizations!inner(id, name, caller_id, subscription_status, call_credits(*))').eq('id', campaignId).single()
+            supabase.from('campaigns').select('*, organization:organizations!inner(id, name, caller_id, subscription_status, call_credits(*)), campaign_projects(project_id, project:projects(id, name, description, address, city, locality, construction_status, possession_date, rera_number, amenities))').eq('id', campaignId).single()
         ]);
 
         if (contextError || !context || !campaignData) {
@@ -33,7 +33,14 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
         const credits = organization?.call_credits;
         const balance = Array.isArray(credits) ? parseFloat(credits[0]?.balance || 0) : parseFloat(credits?.balance || 0);
 
-        if (!['active', 'running'].includes(campaign.status) || (context.project && context.project.archived_at)) {
+        // Derive campaign projects (junction table rows); backward-compat fallback to lead's project
+        let campaignProjects = campaign.campaign_projects?.map(cp => cp.project).filter(Boolean) || [];
+        if (campaignProjects.length === 0 && campaign.project_id) {
+            campaignProjects = [context.project].filter(Boolean);
+        }
+        const campaignProjectIds = campaignProjects.map(p => p.id);
+
+        if (!['active', 'running'].includes(campaign.status)) {
             logger.warn('Campaign or project inactive — rejecting call', { callSid, status: campaign.status });
             try { await plivoClient.calls.hangup(callSid); } catch (_) {}
             plivoWS.close();
@@ -126,7 +133,7 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                 logger.info('OpenAI WS ready', { callSid });
 
                 await plivoWS.startPromise;
-                await sendSessionUpdate(realtimeWS, context, campaign, callSid);
+                await sendSessionUpdate(realtimeWS, context, campaign, campaignProjects, callSid);
                 realtimeWS.send(JSON.stringify({ type: 'response.create' }));
 
                 callLogId = await logCallStart(context, campaign, callSid);
@@ -171,7 +178,7 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
 
                         let result;
                         try {
-                            result = await dispatchTool(name, args, { plivoWS, realtimeWS, callSid, leadId, campaignId, callLogId, organizationId: organization.id });
+                            result = await dispatchTool(name, args, { plivoWS, realtimeWS, callSid, leadId, campaignId, callLogId, organizationId: organization.id, campaignProjectIds });
                         } catch (err) {
                             logger.error('Tool dispatch error', { callSid, tool: name, error: err.message });
                             result = { success: false, error: err.message };
@@ -228,32 +235,32 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
     }
 }
 
-async function sendSessionUpdate(realtimeWS, lead, campaign, callSid) {
+async function sendSessionUpdate(realtimeWS, lead, campaign, campaignProjects, callSid) {
+    // Fetch all org projects for the "other projects" section (cached 30min)
     const cacheKey = `projects_${campaign.organization_id}`;
-    let projects = getCachedContext(cacheKey);
+    let allOrgProjects = getCachedContext(cacheKey);
 
-    if (!projects) {
+    if (!allOrgProjects) {
         const { data } = await supabase.from('projects')
-            .select('name, description, location')
+            .select('id, name, description, locality, city, address')
             .eq('organization_id', campaign.organization_id)
             .eq('status', 'active');
-        projects = data || [];
-        setCachedContext(cacheKey, projects);
+        allOrgProjects = data || [];
+        setCachedContext(cacheKey, allOrgProjects);
     }
 
     logger.info('Session context', {
         callSid,
         leadName: lead.name,
         leadProject: lead.project?.name || 'none',
-        projectId: lead.project_id,
-        orgProjects: projects.map(p => p.name),
+        campaignProjects: campaignProjects.map(p => p.name),
         language: campaign.call_settings?.language,
         voice: campaign.call_settings?.voice_id
     });
 
-    const sessionUpdate = createSessionUpdate(lead, campaign, projects);
+    const sessionUpdate = createSessionUpdate(lead, campaign, campaignProjects, allOrgProjects);
     if (realtimeWS.readyState === WebSocket.OPEN) {
         realtimeWS.send(JSON.stringify(sessionUpdate));
-        logger.info('session.update sent', { callSid, voice: campaign.call_settings?.voice_id, lang: campaign.call_settings?.language });
+        logger.info('session.update sent', { callSid, voice: campaign.call_settings?.voice_id, lang: campaign.call_settings?.language, campaignProjectCount: campaignProjects.length });
     }
 }

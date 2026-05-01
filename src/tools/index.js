@@ -6,14 +6,14 @@ import { handleScheduleCallback } from './callback.js';
 import { handleBookSiteVisit } from './bookSiteVisit.js';
 import { logger } from '../lib/logger.js';
 
-export async function dispatchTool(name, args, { plivoWS, realtimeWS, callSid, leadId, campaignId, callLogId, organizationId }) {
+export async function dispatchTool(name, args, { plivoWS, realtimeWS, callSid, leadId, campaignId, callLogId, organizationId, campaignProjectIds = [] }) {
     switch (name) {
         case 'transfer_call':
             return handleTransfer(plivoWS, realtimeWS, callSid, leadId, campaignId, args, callLogId);
         case 'disconnect_call':
             return handleDisconnect(plivoWS, realtimeWS, callSid, leadId, args, callLogId);
         case 'check_detailed_inventory':
-            return handleDetailedInventory(leadId, args);
+            return handleDetailedInventory(leadId, args, { campaignProjectIds });
         case 'schedule_callback':
             return handleScheduleCallback(leadId, campaignId, args);
         case 'log_intent':

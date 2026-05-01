@@ -1,7 +1,12 @@
-export const createSessionUpdate = (context, campaign, otherProjects = []) => {
+export const createSessionUpdate = (context, campaign, campaignProjects = [], allOrgProjects = []) => {
     const lead = context;
-    const project = lead.project || {};
     const callSettings = campaign?.call_settings || {};
+
+    // Primary project: lead's own if it's in campaign projects, else first campaign project, else lead's project
+    const primaryProject = campaignProjects.find(p => p.id === lead.project_id)
+        || campaignProjects[0]
+        || lead.project
+        || {};
 
     const voice = callSettings.voice_id || 'shimmer';
     const langCode = callSettings.language === 'english' ? 'en'
@@ -14,9 +19,12 @@ export const createSessionUpdate = (context, campaign, otherProjects = []) => {
         1000
     );
 
-    const projectsText = otherProjects.length > 0
-        ? otherProjects.slice(0, 3).map(p => `- ${p.name}: ${p.location || p.description || ''}`).join('\n')
-        : 'Contact support for other projects.';
+    // "Other projects" = org projects not covered by this campaign
+    const campaignProjectIdSet = new Set(campaignProjects.map(p => p.id));
+    const otherOrgProjects = allOrgProjects.filter(p => !campaignProjectIdSet.has(p.id));
+    const projectsText = otherOrgProjects.length > 0
+        ? otherOrgProjects.slice(0, 3).map(p => `- ${p.name}: ${p.locality || p.city || p.description || ''}`).join('\n')
+        : 'No other projects at this time.';
 
     const nowIST = new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
     const timeIST = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' });
@@ -57,6 +65,17 @@ export const createSessionUpdate = (context, campaign, otherProjects = []) => {
         ? `2. QUALIFY gently — You already know their preferences. Acknowledge what they are looking for (e.g. "To aap ${lead.preferred_configuration || 'property'} dekh rahe the ${lead.preferred_location || ''} mein...") and ask if they are still looking or have found something.`
         : `2. QUALIFY gently — Ask ONE question at a time:\n   - "Kaunse type ka ghar dekhna hai aapko? 2BHK, 3BHK?"\n   - Then budget: "Budget range kya hai aapka roughly?"\n   - Then timeline/preference based on their answers`;
 
+    // Build campaign projects context for system prompt
+    const campaignProjectsText = campaignProjects.length > 1
+        ? campaignProjects.map((p, i) =>
+            `Project ${i + 1}: ${p.name}\n  Location: ${p.locality || p.city || p.address || ''}\n  Status: ${p.construction_status || 'Under Development'}\n  Possession: ${p.possession_date || 'TBD'}`
+        ).join('\n\n')
+        : `Project: ${primaryProject.name || 'Our Project'}\n  Status: ${primaryProject.construction_status || 'Under Development'}\n  Possession: ${primaryProject.possession_date || 'Ask team for details'}\n  Location: ${primaryProject.locality || primaryProject.city || primaryProject.address || ''}`;
+
+    const campaignScopeText = campaignProjects.length > 1
+        ? `You represent ${campaignProjects.length} projects in this campaign:\n${campaignProjects.map((p, i) => `${i + 1}. ${p.name} (${p.locality || p.city || ''})`).join('\n')}\nLead's registered project: ${primaryProject.name || 'one of our projects'}. Start with their project but naturally mention others if they seem interested in options or comparisons.`
+        : `You represent: ${primaryProject.name || 'Our Project'}`;
+
     const systemInstructions = `
 # WHO YOU ARE
 You are Riya — a friendly, sharp Sales Consultant at ${orgName}.
@@ -83,11 +102,11 @@ Start with a warm, casual greeting. Examples:
 - "Hi ${firstName} ji, main Riya hoon ${orgName} se. Hope accha time hai — I just wanted to quickly chat about the property you were looking at."
 After greeting, PAUSE and let them respond before asking anything else.
 
+# CAMPAIGN SCOPE
+${campaignScopeText}
+
 # WHAT YOU KNOW
-Project: ${project.name || 'Our Project'}
-Status: ${project.construction_status || 'Under Development'}
-Possession: ${project.possession_date || 'Ask team for details'}
-Location: ${project.location || project.address || ''}${prefsText}
+${campaignProjectsText}${prefsText}
 
 # YOUR CONVERSATION FLOW
 1. GREET warmly (see above). Wait for response.
@@ -192,7 +211,7 @@ If a unit's price shows as "PRICE_UNDISCLOSED":
                 {
                     type: 'function',
                     name: 'check_detailed_inventory',
-                    description: "Search available units. ALWAYS use config_name for BHK (e.g. '2BHK', '2.5BHK'). Never assume availability — check first.",
+                    description: `Search available units. ALWAYS use config_name for BHK (e.g. '2BHK', '2.5BHK'). Never assume availability — check first.${campaignProjects.length > 1 ? ` This campaign covers ${campaignProjects.length} projects: ${campaignProjects.map(p => p.name).join(', ')}. You can specify project_name to search a specific one, or omit to search the lead's primary project.` : ''}`,
                     parameters: {
                         type: 'object',
                         properties: {
@@ -208,7 +227,11 @@ If a unit's price shows as "PRICE_UNDISCLOSED":
                             is_corner: { type: 'boolean' },
                             facing: { type: 'string', description: 'Direction: East, North, West, South, North-East, etc.' },
                             floor_min: { type: 'number' },
-                            floor_max: { type: 'number' }
+                            floor_max: { type: 'number' },
+                            ...(campaignProjects.length > 1 ? {
+                                project_id: { type: 'string', description: `UUID of a specific campaign project to search. Valid IDs: ${campaignProjects.map(p => p.id).join(', ')}` },
+                                project_name: { type: 'string', description: `Name of a campaign project: ${campaignProjects.map(p => `"${p.name}"`).join(', ')}` }
+                            } : {})
                         }
                     }
                 },
