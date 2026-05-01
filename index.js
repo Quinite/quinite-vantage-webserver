@@ -5,6 +5,7 @@ import dotenv from 'dotenv';
 import answerRouter from './src/routes/answer.js';
 import recordingRouter from './src/routes/recording.js';
 import statusRouter from './src/routes/status.js';
+import hangupRouter from './src/routes/hangup.js';
 import { startRealtimeWSConnection } from './src/websocket/handler.js';
 import { logger } from './src/lib/logger.js';
 
@@ -23,6 +24,7 @@ app.get(['/', '/health'], (req, res) => res.send('OK'));
 app.use('/answer', answerRouter);
 app.use('/recording', recordingRouter);
 app.use('/status', statusRouter);
+app.use('/calls', hangupRouter);
 // Transfers the A-leg to a human agent, whispering call context to the agent (B-leg) upon answer
 app.get('/transfer-xml', (req, res) => {
     const { target, context } = req.query;
