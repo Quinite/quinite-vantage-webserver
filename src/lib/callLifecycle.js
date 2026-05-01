@@ -19,11 +19,16 @@ export async function logCallStart(lead, campaign, callSid) {
 
     if (error) {
         logger.error('logCallStart insert failed', { callSid, leadId: lead.id, campaignId: campaign.id, error: error.message });
+        return null;
     }
 
     const logId = data?.id;
     if (logId) {
-        await supabase.rpc('increment_campaign_stat', { campaign_uuid: campaign.id, stat_name: 'total_calls' });
+        // Non-critical stat — failure must not affect call flow
+        supabase.rpc('increment_campaign_stat', { campaign_uuid: campaign.id, stat_name: 'total_calls' })
+            .then(({ error: rpcErr }) => {
+                if (rpcErr) logger.warn('increment_campaign_stat failed', { campaignId: campaign.id, error: rpcErr.message });
+            });
     }
     return logId;
 }
@@ -34,6 +39,17 @@ export async function finalizeCallOutcome(callLogId, leadId, campaignId, transcr
         const durationSecs = Math.max(0, Math.round((Date.now() - callStartTime) / 1000));
         const COST_PER_MINUTE = parseFloat(process.env.CALL_COST_PER_MINUTE || '1.0');
         const callCost = parseFloat(((durationSecs / 60) * COST_PER_MINUTE).toFixed(4));
+
+        if (!callLogId && campaignId && leadId) {
+            // No call_log row — unblock campaign_leads and exit early
+            await supabase.from('campaign_leads').update({
+                status: durationSecs > 0 ? 'called' : 'failed',
+                last_call_attempt_at: endedAt,
+                updated_at: endedAt,
+            }).match({ campaign_id: campaignId, lead_id: leadId }).eq('status', 'calling');
+            logger.warn('finalizeCallOutcome: no callLogId — campaign_lead updated, skipping log/credits', { callSid, leadId, campaignId });
+            return;
+        }
 
         // Set completed status only if still in_progress; preserve transferred/abusive terminal states
         await supabase.from('call_logs')

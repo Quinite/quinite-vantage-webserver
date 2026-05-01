@@ -68,9 +68,9 @@ export const createSessionUpdate = (context, campaign, campaignProjects = [], al
     // Build campaign projects context for system prompt
     const campaignProjectsText = campaignProjects.length > 1
         ? campaignProjects.map((p, i) =>
-            `Project ${i + 1}: ${p.name}\n  Location: ${p.locality || p.city || p.address || ''}\n  Status: ${p.construction_status || 'Under Development'}\n  Possession: ${p.possession_date || 'TBD'}`
+            `Project ${i + 1}: ${p.name}\n  Location: ${p.locality || p.city || p.address || ''}\n  Possession: ${p.possession_date || 'TBD'}`
         ).join('\n\n')
-        : `Project: ${primaryProject.name || 'Our Project'}\n  Status: ${primaryProject.construction_status || 'Under Development'}\n  Possession: ${primaryProject.possession_date || 'Ask team for details'}\n  Location: ${primaryProject.locality || primaryProject.city || primaryProject.address || ''}`;
+        : `Project: ${primaryProject.name || 'Our Project'}\n  Possession: ${primaryProject.possession_date || 'Ask team for details'}\n  Location: ${primaryProject.locality || primaryProject.city || primaryProject.address || ''}`;
 
     const campaignScopeText = campaignProjects.length > 1
         ? `You represent ${campaignProjects.length} projects in this campaign:\n${campaignProjects.map((p, i) => `${i + 1}. ${p.name} (${p.locality || p.city || ''})`).join('\n')}\nLead's registered project: ${primaryProject.name || 'one of our projects'}. Start with their project but naturally mention others if they seem interested in options or comparisons.`

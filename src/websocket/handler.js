@@ -71,6 +71,7 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
         let silenceTimer = null;
         let cleanupCalled = false;
         let keepalive = null;
+        let responseActive = false; // tracks whether OpenAI has an active response in-flight
 
         const silenceTimeoutMs = (campaign.call_settings?.silence_timeout || 15) * 1000;
 
@@ -101,21 +102,10 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
             if (keepalive) clearInterval(keepalive);
             if (realtimeWS.readyState === WebSocket.OPEN) realtimeWS.close();
 
-            if (callLogId) {
-                await finalizeCallOutcome(
-                    callLogId, leadId, campaignId, conversationTranscript,
-                    callSid, callStartTime || Date.now(), organization.id, campaign.name
-                );
-            } else if (campaignId && leadId) {
-                // Call ended before call_log was created (user hung up very early or OpenAI failed).
-                // Still unblock campaign_leads so it doesn't stay stuck on 'calling'.
-                await supabase.from('campaign_leads').update({
-                    status: 'failed',
-                    last_call_attempt_at: new Date().toISOString(),
-                    updated_at: new Date().toISOString(),
-                }).match({ campaign_id: campaignId, lead_id: leadId }).eq('status', 'calling');
-                logger.warn('cleanup: no callLogId — campaign_lead marked failed', { callSid, leadId, campaignId });
-            }
+            await finalizeCallOutcome(
+                callLogId, leadId, campaignId, conversationTranscript,
+                callSid, callStartTime || Date.now(), organization.id, campaign.name
+            );
         };
 
         // Wire cleanup to both sides before anything can close them
@@ -192,11 +182,22 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                         break;
                     }
 
+                    case 'response.created':
+                        responseActive = true;
+                        break;
+
+                    case 'response.done':
+                    case 'response.cancelled':
+                        responseActive = false;
+                        break;
+
                     case 'input_audio_buffer.speech_started':
                         if (plivoWS.readyState === WebSocket.OPEN) {
                             plivoWS.send(JSON.stringify({ event: 'clearAudio' }));
                         }
-                        realtimeWS.send(JSON.stringify({ type: 'response.cancel' }));
+                        if (responseActive) {
+                            realtimeWS.send(JSON.stringify({ type: 'response.cancel' }));
+                        }
                         break;
 
                     case 'response.audio.delta':
