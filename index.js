@@ -23,16 +23,29 @@ app.get(['/', '/health'], (req, res) => res.send('OK'));
 app.use('/answer', answerRouter);
 app.use('/recording', recordingRouter);
 app.use('/status', statusRouter);
-// Transfers the A-leg to a human agent, optionally whispering call context first
+// Transfers the A-leg to a human agent, whispering call context to the agent (B-leg) upon answer
 app.get('/transfer-xml', (req, res) => {
     const { target, context } = req.query;
     if (!target) return res.status(400).send('Missing target');
     res.set('Content-Type', 'text/xml');
-    // Speak context to the agent (B-leg whisper) before bridging the lead through
+
+    if (context) {
+        // Use confirmSoundUrl to whisper context to the agent (B-leg) before bridging
+        const whisperUrl = `${process.env.WEBSOCKET_SERVER_URL}/whisper-xml?context=${encodeURIComponent(context)}`;
+        res.send(`<Response><Dial><Number confirmSoundUrl="${whisperUrl.replace(/&/g, '&amp;')}">${target}</Number></Dial></Response>`);
+    } else {
+        res.send(`<Response><Dial><Number>${target}</Number></Dial></Response>`);
+    }
+});
+
+// Returns Speak XML for whispering context to an agent during transfer
+app.get('/whisper-xml', (req, res) => {
+    const { context } = req.query;
+    res.set('Content-Type', 'text/xml');
     const speakXml = context
         ? `<Speak voice="Polly.Joanna">${context.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</Speak>`
         : '';
-    res.send(`<Response>${speakXml}<Dial><Number>${target}</Number></Dial></Response>`);
+    res.send(`<Response>${speakXml}</Response>`);
 });
 
 server.on('upgrade', (request, socket, head) => {
