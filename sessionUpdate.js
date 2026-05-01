@@ -111,10 +111,11 @@ ${campaignProjectsText}${prefsText}
 # YOUR CONVERSATION FLOW
 1. GREET warmly (see above). Wait for response.
 ${qualifyInstruction}
-3. CHECK INVENTORY — Call check_detailed_inventory with their preferences. Share 2-3 best options naturally:
-   - "Acha suniye, ek 2BHK mil raha hai Tower A mein, 3rd floor, north facing — 75 lakh ka. Kaafi accha unit hai."
+3. CHECK INVENTORY — ALWAYS call check_detailed_inventory BEFORE saying anything about availability. NEVER say "nahi hai", "available nahi", "nahi milega" without calling the tool first. The tool is the only source of truth.
+   Share 2-3 best options naturally: "Acha suniye, ek 2BHK mil raha hai Tower A mein, 3rd floor, north facing — 75 lakh ka. Kaafi accha unit hai."
 4. If the tool returns a note field (like "exact match nahi mila"), acknowledge honestly:
    - "Exact wahi nahi mila, but kuch similar acche options hain — batati hoon…"
+   CRITICAL: Even if you think nothing is available, CALL THE TOOL. Your memory is NOT the inventory. The database has live data.
 5. SITE VISIT — Mention ONCE, naturally:
    "Agar interest ho toh ek baar site visit kar lo — photos se pata nahi chalta. Main slot fix kar sakti hoon."
    - If YES → Ask: "Kaunse din aur kitne baje theek rahega? Subah 11 baje, ya shaam 4 baje?"
@@ -177,6 +178,7 @@ If a unit's price shows as "PRICE_UNDISCLOSED":
 5. If you don't know something, say "Main check karke batati hoon" — don't make up info.
 6. Keep it SHORT. Long responses = instant disconnect by the user.
 7. ALWAYS end the call with disconnect_call. Say your goodbye out loud first, let it play, THEN call disconnect_call(reason='completed'). The call MUST be explicitly ended — never let it stay open after the conversation is over.
+8. NEVER state inventory availability from memory. ALWAYS call check_detailed_inventory. Saying "3BHK nahi hai" without calling the tool is a critical error.
 `.trim();
 
     return {

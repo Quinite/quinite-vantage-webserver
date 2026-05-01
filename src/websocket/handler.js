@@ -122,12 +122,19 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                 clearTimeout(startupTimeout);
                 logger.info('OpenAI WS ready', { callSid });
 
-                await plivoWS.startPromise;
+                // Send session config immediately — no need to wait for Plivo 'start'.
+                // Plivo 'start' is only needed before audio can flow, not for session setup.
                 await sendSessionUpdate(realtimeWS, context, campaign, campaignProjects, callSid);
-                realtimeWS.send(JSON.stringify({ type: 'response.create' }));
 
-                callLogId = await logCallStart(context, campaign, callSid);
+                // Wait for Plivo stream + DB log in parallel, then trigger AI greeting.
+                const [resolvedCallLogId] = await Promise.all([
+                    logCallStart(context, campaign, callSid),
+                    plivoWS.startPromise
+                ]);
+                callLogId = resolvedCallLogId;
                 callStartTime = Date.now();
+
+                realtimeWS.send(JSON.stringify({ type: 'response.create' }));
                 resetSilenceTimer();
 
                 // Prevent idle connection drops on cloud proxies
