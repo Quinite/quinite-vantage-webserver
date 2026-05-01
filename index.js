@@ -23,12 +23,16 @@ app.get(['/', '/health'], (req, res) => res.send('OK'));
 app.use('/answer', answerRouter);
 app.use('/recording', recordingRouter);
 app.use('/status', statusRouter);
-// Returns Plivo XML to dial a target number (used for human transfer)
+// Transfers the A-leg to a human agent, optionally whispering call context first
 app.get('/transfer-xml', (req, res) => {
-    const { target } = req.query;
+    const { target, context } = req.query;
     if (!target) return res.status(400).send('Missing target');
     res.set('Content-Type', 'text/xml');
-    res.send(`<Response><Dial><Number>${target}</Number></Dial></Response>`);
+    // Speak context to the agent (B-leg whisper) before bridging the lead through
+    const speakXml = context
+        ? `<Speak voice="Polly.Joanna">${context.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</Speak>`
+        : '';
+    res.send(`<Response>${speakXml}<Dial><Number>${target}</Number></Dial></Response>`);
 });
 
 server.on('upgrade', (request, socket, head) => {
