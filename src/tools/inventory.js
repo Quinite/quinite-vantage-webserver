@@ -149,7 +149,8 @@ export async function handleDetailedInventory(leadId, args, context = {}) {
 }
 
 function formatUnit(u) {
-    const priceHidden = u.price_undisclosed || u.config?.price_undisclosed || false;
+    // Unit-level flag takes precedence; only fall back to config if unit flag is null/undefined
+    const priceHidden = u.price_undisclosed != null ? u.price_undisclosed : (u.config?.price_undisclosed ?? false);
     return {
         unit_id: u.id,
         unit_no: u.unit_number,

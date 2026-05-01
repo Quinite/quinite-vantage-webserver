@@ -66,11 +66,19 @@ export const createSessionUpdate = (context, campaign, campaignProjects = [], al
         : `2. QUALIFY gently — Ask ONE question at a time:\n   - "Kaunse type ka ghar dekhna hai aapko? 2BHK, 3BHK?"\n   - Then budget: "Budget range kya hai aapka roughly?"\n   - Then timeline/preference based on their answers`;
 
     // Build campaign projects context for system prompt
+    const formatProject = (p, label) => {
+        const lines = [`${label}: ${p.name || 'Our Project'}`];
+        lines.push(`  Location: ${p.locality || p.city || p.address || ''}`);
+        lines.push(`  Possession: ${p.possession_date || 'Ask team for details'}`);
+        if (p.description) lines.push(`  About: ${p.description}`);
+        if (p.rera_number) lines.push(`  RERA: ${p.rera_number}`);
+        if (p.amenities) lines.push(`  Amenities: ${Array.isArray(p.amenities) ? p.amenities.join(', ') : p.amenities}`);
+        return lines.join('\n');
+    };
+
     const campaignProjectsText = campaignProjects.length > 1
-        ? campaignProjects.map((p, i) =>
-            `Project ${i + 1}: ${p.name}\n  Location: ${p.locality || p.city || p.address || ''}\n  Possession: ${p.possession_date || 'TBD'}`
-        ).join('\n\n')
-        : `Project: ${primaryProject.name || 'Our Project'}\n  Possession: ${primaryProject.possession_date || 'Ask team for details'}\n  Location: ${primaryProject.locality || primaryProject.city || primaryProject.address || ''}`;
+        ? campaignProjects.map((p, i) => formatProject(p, `Project ${i + 1}`)).join('\n\n')
+        : formatProject(primaryProject, 'Project');
 
     const campaignScopeText = campaignProjects.length > 1
         ? `You represent ${campaignProjects.length} projects in this campaign:\n${campaignProjects.map((p, i) => `${i + 1}. ${p.name} (${p.locality || p.city || ''})`).join('\n')}\nLead's registered project: ${primaryProject.name || 'one of our projects'}. Start with their project but naturally mention others if they seem interested in options or comparisons.`
@@ -156,6 +164,7 @@ Vastu: East/North-facing preferred
 Payment Plans: CLP (Construction Linked), TLP (Time Linked), Down Payment
 Home Loans: SBI, HDFC, ICICI, Axis
 NRI: FEMA compliant, repatriation allowed
+RERA: If a lead asks about RERA registration, refer to the RERA number in the project details above. If RERA is listed, confirm it's RERA registered and share the number. If not listed, say "Main RERA details verify karke aapko bhejti hoon" — never make up a number.
 
 # OTHER PROJECTS
 ${projectsText}
