@@ -39,9 +39,6 @@ Return JSON only:
 
         const analysis = JSON.parse(completion.choices[0].message.content);
 
-        const sentimentLabel = analysis.sentiment_score > 0.3 ? 'Positive'
-            : analysis.sentiment_score < -0.3 ? 'Negative' : 'Neutral';
-
         // Fetch existing ai_metadata to preserve fields set during the call (e.g. interested_project_id)
         const { data: existingLog } = await supabase.from('call_logs').select('ai_metadata').eq('id', callLogId).single();
         const mergedMeta = {
@@ -55,7 +52,6 @@ Return JSON only:
         await supabase.from('call_logs').update({
             summary: analysis.summary,
             sentiment_score: analysis.sentiment_score,
-            sentiment_label: sentimentLabel,
             interest_level: analysis.interest_level,
             ai_metadata: mergedMeta
         }).eq('id', callLogId);

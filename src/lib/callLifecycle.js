@@ -22,15 +22,8 @@ export async function logCallStart(lead, campaign, callSid) {
         return null;
     }
 
-    const logId = data?.id;
-    if (logId) {
-        // Non-critical stat — failure must not affect call flow
-        supabase.rpc('increment_campaign_stat', { campaign_uuid: campaign.id, stat_name: 'total_calls' })
-            .then(({ error: rpcErr }) => {
-                if (rpcErr) logger.warn('increment_campaign_stat failed', { campaignId: campaign.id, error: rpcErr.message });
-            });
-    }
-    return logId;
+    // total_calls is incremented atomically by the tr_call_logs_stats DB trigger on INSERT
+    return data?.id ?? null;
 }
 
 export async function finalizeCallOutcome(callLogId, leadId, campaignId, transcript, callSid, callStartTime, organizationId, campaignName) {
