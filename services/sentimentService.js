@@ -1,6 +1,7 @@
 import OpenAI from 'openai';
 import { supabase } from './supabase.js';
 import { logger } from '../src/lib/logger.js';
+import { updateLeadProject } from '../src/lib/updateLeadProject.js';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -41,17 +42,22 @@ Return JSON only:
         const sentimentLabel = analysis.sentiment_score > 0.3 ? 'Positive'
             : analysis.sentiment_score < -0.3 ? 'Negative' : 'Neutral';
 
+        // Fetch existing ai_metadata to preserve fields set during the call (e.g. interested_project_id)
+        const { data: existingLog } = await supabase.from('call_logs').select('ai_metadata').eq('id', callLogId).single();
+        const mergedMeta = {
+            ...(existingLog?.ai_metadata || {}),
+            objections: analysis.objections,
+            budget_estimated: analysis.budget,
+            priority_score: analysis.priority,
+            key_takeaways: analysis.key_takeaways,
+        };
+
         await supabase.from('call_logs').update({
             summary: analysis.summary,
             sentiment_score: analysis.sentiment_score,
             sentiment_label: sentimentLabel,
             interest_level: analysis.interest_level,
-            ai_metadata: {
-                objections: analysis.objections,
-                budget_estimated: analysis.budget,
-                priority_score: analysis.priority,
-                key_takeaways: analysis.key_takeaways
-            }
+            ai_metadata: mergedMeta
         }).eq('id', callLogId);
 
         // Update lead with AI-derived behavioral signals
@@ -59,6 +65,11 @@ Return JSON only:
             interest_level: analysis.interest_level,
             score: Math.round(analysis.priority),
         }).eq('id', leadId);
+
+        // Auto-update lead's project if logIntent captured a different interested project
+        if (mergedMeta.interested_project_id) {
+            await updateLeadProject(leadId, mergedMeta.interested_project_id, 'ai_call', callLogId);
+        }
 
         if (campaignId && analysis.sentiment_score != null) {
             await supabase.rpc('update_campaign_sentiment', {

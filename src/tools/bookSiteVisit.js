@@ -1,5 +1,6 @@
 import { supabase } from '../../services/supabase.js';
 import { logger } from '../lib/logger.js';
+import { updateLeadProject } from '../lib/updateLeadProject.js';
 
 export async function handleBookSiteVisit(leadId, organizationId, args, callLogId) {
     const { scheduled_date, scheduled_time, unit_id, notes } = args;
@@ -47,6 +48,16 @@ export async function handleBookSiteVisit(leadId, organizationId, args, callLogI
     if (insertError || !visit) {
         logger.error('bookSiteVisit: insert failed', { leadId, error: insertError?.message });
         return { success: false, error: 'Could not book site visit' };
+    }
+
+    // Auto-update lead's project if the booked unit belongs to a different project
+    if (unit_id && lead.project_id) {
+        const { data: unit } = await supabase.from('units').select('project_id').eq('id', unit_id).single();
+        if (unit?.project_id && unit.project_id !== lead.project_id) {
+            await updateLeadProject(leadId, unit.project_id, 'site_visit', visit.id);
+        }
+    } else if (!lead.project_id && visit.project_id) {
+        await updateLeadProject(leadId, visit.project_id, 'site_visit', visit.id);
     }
 
     // Merge site_visit info into call_logs.ai_metadata

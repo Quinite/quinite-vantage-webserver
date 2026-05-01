@@ -1,6 +1,7 @@
 import { supabase } from '../../services/supabase.js';
 import { getCallerId } from '../../services/plivo.js';
 import { analyzeSentiment } from '../../services/sentimentService.js';
+import { updateLeadProject } from './updateLeadProject.js';
 import { logger } from './logger.js';
 
 export async function logCallStart(lead, campaign, callSid) {
@@ -130,10 +131,11 @@ export async function finalizeCallOutcome(callLogId, leadId, campaignId, transcr
 
         // Create WhatsApp brochure task if lead requested it during the call
         if (finalLog?.ai_metadata?.whatsapp_brochure_requested && leadData?.assigned_to) {
-            await supabase.from('tasks').insert({
+            const interestedProjectId = finalLog.ai_metadata?.interested_project_id || leadData.project_id || null;
+            const { data: brochureTask } = await supabase.from('tasks').insert({
                 lead_id: leadId,
                 organization_id: organizationId,
-                project_id: leadData.project_id || null,
+                project_id: interestedProjectId,
                 title: 'Send project brochure via WhatsApp',
                 description: `Lead requested brochure during AI call. Campaign: ${campaignName || campaignId}`,
                 assigned_to: leadData.assigned_to,
@@ -141,8 +143,13 @@ export async function finalizeCallOutcome(callLogId, leadId, campaignId, transcr
                 priority: 'medium',
                 status: 'pending',
                 due_date: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString().slice(0, 10),
-            });
+            }).select('id').single();
             logger.info('WhatsApp brochure task created', { callSid, leadId });
+
+            // Auto-update lead project if brochure task is for a different project
+            if (brochureTask?.id && interestedProjectId && interestedProjectId !== leadData.project_id) {
+                await updateLeadProject(leadId, interestedProjectId, 'ai_task', brochureTask.id);
+            }
         }
 
         // Non-blocking sentiment analysis

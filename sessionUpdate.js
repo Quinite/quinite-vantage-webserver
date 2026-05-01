@@ -232,7 +232,8 @@ If a unit's price shows as "PRICE_UNDISCLOSED":
                             preferred_contact_method: { type: 'string', description: 'call, whatsapp, email' },
                             best_contact_time: { type: 'string', description: 'morning, afternoon, evening' },
                             purchase_readiness: { type: 'string', description: 'AI assessment: ready_to_buy, evaluating, early_stage, not_ready' },
-                            whatsapp_brochure: { type: 'boolean', description: 'Set true if lead explicitly asked to send project brochure on WhatsApp' }
+                            whatsapp_brochure: { type: 'boolean', description: 'Set true if lead explicitly asked to send project brochure on WhatsApp' },
+                            interested_project_id: { type: 'string', description: 'UUID of the project the lead expressed strong interest in, if different from the current campaign project. Only set when lead clearly prefers a specific other project.' }
                         },
                         required: ['interest_level']
                     }

@@ -33,7 +33,8 @@ export async function handleLogIntent(leadId, args, callLogId) {
     const mergedMeta = {
         ...(existing?.ai_metadata || {}),
         ...args,
-        ...(args.whatsapp_brochure ? { whatsapp_brochure_requested: true } : {})
+        ...(args.whatsapp_brochure ? { whatsapp_brochure_requested: true } : {}),
+        ...(args.interested_project_id ? { interested_project_id: args.interested_project_id } : {})
     };
 
     await supabase.from('call_logs').update({ ai_metadata: mergedMeta }).eq('id', callLogId);
