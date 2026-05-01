@@ -8,8 +8,26 @@ dotenv.config();
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-export async function analyzeSentiment(transcript, leadId, callLogId, organizationId, callSid, campaignId) {
+export async function analyzeSentiment(transcript, leadId, callLogId, organizationId, callSid, campaignId, durationSecs = 0) {
     if (!transcript || transcript.length < 50) return null;
+
+    // Require the user to have actually spoken — AI-only transcripts produce false positives
+    const userLines = transcript.split('\n').filter(l => l.startsWith('User:'));
+    const userWordCount = userLines.join(' ').split(/\s+/).filter(Boolean).length;
+
+    if (userWordCount < 5 || durationSecs < 20) {
+        logger.info('Skipping sentiment — call too short or user did not speak', { callSid, durationSecs, userWordCount });
+        // Write conservative defaults so the UI doesn't show blank or misleading data
+        const { data: existingLog } = await supabase.from('call_logs').select('ai_metadata').eq('id', callLogId).single();
+        await supabase.from('call_logs').update({
+            summary: 'Call ended before conversation could begin.',
+            sentiment_score: 0,
+            interest_level: 'none',
+            ai_metadata: { ...(existingLog?.ai_metadata || {}), priority_score: 0 }
+        }).eq('id', callLogId);
+        await supabase.from('leads').update({ interest_level: 'none', score: 0 }).eq('id', leadId);
+        return null;
+    }
 
     try {
         logger.info('Running sentiment analysis', { callSid });

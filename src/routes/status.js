@@ -6,6 +6,63 @@ const router = express.Router();
 
 const FAILED_STATUSES = new Set(['failed', 'busy', 'no-answer', 'no_answer', 'rejected', 'canceled', 'cancelled']);
 const TERMINAL_STATUSES = new Set([...FAILED_STATUSES, 'completed']);
+const MAX_ATTEMPTS = 4;
+const RETRY_DELAY_MS = 30 * 60 * 1000; // 30 min between retries
+
+// Handles a failed Plivo call: re-queues for retry if attempts remain, else marks permanently failed.
+async function handleFailedCall(campaignId, leadId, callLogId, endedAt, callStatus) {
+    // Read current attempt count + org from campaign_leads in one query
+    const { data: cl } = await supabase.from('campaign_leads')
+        .select('attempt_count, organization_id')
+        .match({ campaign_id: campaignId, lead_id: leadId })
+        .maybeSingle();
+
+    const attempts = (cl?.attempt_count || 0) + 1;
+    const hasRetries = attempts < MAX_ATTEMPTS;
+
+    if (hasRetries) {
+        const nextRetryAt = new Date(Date.now() + attempts * RETRY_DELAY_MS).toISOString();
+
+        // Re-insert a retry entry into call_queue
+        await supabase.from('call_queue').insert({
+            campaign_id: campaignId,
+            lead_id: leadId,
+            organization_id: cl?.organization_id || null,
+            status: 'failed',
+            attempt_count: attempts,
+            last_error: callStatus,
+            next_retry_at: nextRetryAt,
+        });
+
+        // Keep campaign_leads as 'queued' so the auto-complete trigger doesn't fire
+        await supabase.from('campaign_leads')
+            .update({
+                status: 'queued',
+                attempt_count: attempts,
+                ...(callLogId ? { call_log_id: callLogId } : {}),
+                last_call_attempt_at: endedAt,
+                updated_at: endedAt,
+            })
+            .match({ campaign_id: campaignId, lead_id: leadId })
+            .eq('status', 'calling');
+
+        logger.info('status webhook: call failed, re-queued for retry', { campaignId, leadId, attempts, nextRetryAt });
+    } else {
+        // Exhausted all retries — mark as permanently failed
+        await supabase.from('campaign_leads')
+            .update({
+                status: 'failed',
+                attempt_count: attempts,
+                ...(callLogId ? { call_log_id: callLogId } : {}),
+                last_call_attempt_at: endedAt,
+                updated_at: endedAt,
+            })
+            .match({ campaign_id: campaignId, lead_id: leadId })
+            .eq('status', 'calling');
+
+        logger.info('status webhook: call failed, max attempts reached', { campaignId, leadId, attempts });
+    }
+}
 
 router.all('/', async (req, res) => {
     // Respond immediately — Plivo does not wait for processing
@@ -53,20 +110,18 @@ router.all('/', async (req, res) => {
         const effectiveLeadId = leadId || callLog.lead_id;
 
         if (effectiveCampaignId && effectiveLeadId) {
-            await supabase.from('campaign_leads')
-                .update({
-                    status: isFailed ? 'failed' : 'called',
-                    call_log_id: callLog.id,
-                    last_call_attempt_at: endedAt,
-                    updated_at: endedAt,
-                })
-                .match({ campaign_id: effectiveCampaignId, lead_id: effectiveLeadId })
-                .eq('status', 'calling');
+            if (isFailed) {
+                await handleFailedCall(effectiveCampaignId, effectiveLeadId, callLog.id, endedAt, callStatus);
+            } else {
+                await supabase.from('campaign_leads')
+                    .update({ status: 'called', call_log_id: callLog.id, last_call_attempt_at: endedAt, updated_at: endedAt })
+                    .match({ campaign_id: effectiveCampaignId, lead_id: effectiveLeadId })
+                    .eq('status', 'calling');
+            }
         }
 
     } else if (isFailed && leadId && campaignId) {
         // Call failed before WebSocket connected — no call_log was ever created.
-        // Create a minimal record so the failure is traceable.
         const { data: camp } = await supabase
             .from('campaigns')
             .select('organization_id, project_id')
@@ -99,17 +154,7 @@ router.all('/', async (req, res) => {
             });
         }
 
-        // Mark campaign_lead as failed
-        await supabase.from('campaign_leads')
-            .update({
-                status: 'failed',
-                last_call_attempt_at: endedAt,
-                updated_at: endedAt,
-            })
-            .match({ campaign_id: campaignId, lead_id: leadId })
-            .eq('status', 'calling');
-
-        logger.info('status webhook: campaign_lead marked failed (no call_log existed)', { leadId, campaignId });
+        await handleFailedCall(campaignId, leadId, null, endedAt, callStatus);
     }
 });
 

@@ -161,8 +161,8 @@ export async function finalizeCallOutcome(callLogId, leadId, campaignId, transcr
             }
         }
 
-        // Non-blocking sentiment analysis
-        analyzeSentiment(transcript, leadId, callLogId, organizationId, callSid, campaignId);
+        // Non-blocking sentiment analysis — skip for very short calls where the user never spoke
+        analyzeSentiment(transcript, leadId, callLogId, organizationId, callSid, campaignId, durationSecs);
 
     } catch (err) {
         logger.error('finalizeCallOutcome failed', { callSid, error: err.message });
