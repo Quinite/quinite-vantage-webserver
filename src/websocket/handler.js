@@ -16,13 +16,13 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
         // Fetch lead and campaign BEFORE creating the OpenAI WS.
         // If we created the WS first and then awaited DB queries, the 'open' event
         // could fire while we're still awaiting — before the handler is registered — and be lost.
-        const [{ data: context, error: contextError }, { data: campaignData }] = await Promise.all([
+        const [{ data: context, error: contextError }, { data: campaignData, error: campaignError }] = await Promise.all([
             supabase.from('leads').select('*, project:projects(*)').eq('id', leadId).single(),
             supabase.from('campaigns').select('*, organization:organizations!inner(id, name, caller_id, subscription_status, call_credits(*)), campaign_projects(project_id, project:projects(id, name, description, address, city, locality, construction_status, possession_date, rera_number, amenities))').eq('id', campaignId).single()
         ]);
 
-        if (contextError || !context || !campaignData) {
-            logger.error('Context fetch failed', { callSid, error: contextError?.message });
+        if (contextError || campaignError || !context || !campaignData) {
+            logger.error('Context fetch failed', { callSid, leadError: contextError?.message, campaignError: campaignError?.message });
             try { await plivoClient.calls.hangup(callSid); } catch (_) {}
             plivoWS.close();
             return null;
