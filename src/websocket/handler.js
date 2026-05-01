@@ -18,7 +18,7 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
         // could fire while we're still awaiting — before the handler is registered — and be lost.
         const [{ data: context, error: contextError }, { data: campaignData, error: campaignError }] = await Promise.all([
             supabase.from('leads').select('*, project:projects(*)').eq('id', leadId).single(),
-            supabase.from('campaigns').select('*, organization:organizations!inner(id, name, caller_id, subscription_status, call_credits(*)), campaign_projects(project_id, project:projects(id, name, description, address, city, locality, construction_status, possession_date, rera_number, amenities))').eq('id', campaignId).single()
+            supabase.from('campaigns').select('*, organization:organizations!inner(id, name, caller_id, subscription_status, call_credits(*)), campaign_projects(project_id, project:projects(id, name, description, address, city, locality, possession_date, rera_number, amenities))').eq('id', campaignId).single()
         ]);
 
         if (contextError || campaignError || !context || !campaignData) {
