@@ -3,6 +3,7 @@ import { getCallerId } from '../../services/plivo.js';
 import { analyzeSentiment } from '../../services/sentimentService.js';
 import { updateLeadProject } from './updateLeadProject.js';
 import { logger } from './logger.js';
+import { firePipelineTrigger, TRIGGER_KEYS } from './pipelineTriggers.js';
 
 export async function logCallStart(lead, campaign, callSid) {
     const { data, error } = await supabase.from('call_logs').insert({
@@ -119,6 +120,36 @@ export async function finalizeCallOutcome(callLogId, leadId, campaignId, transcr
                 last_call_attempt_at: endedAt,
                 updated_at: endedAt
             }).match({ campaign_id: campaignId, lead_id: leadId });
+
+            // Pipeline triggers for call outcomes
+            if (finalCampaignLeadStatus === 'called' && organizationId) {
+                // Only fire call_answered on the first successful call for this lead
+                const { count } = await supabase
+                    .from('call_logs')
+                    .select('id', { count: 'exact', head: true })
+                    .eq('lead_id', leadId)
+                    .eq('call_status', 'completed');
+                if (count === 1) {
+                    firePipelineTrigger(TRIGGER_KEYS.CALL_ANSWERED, leadId, organizationId).catch(() => {});
+                    // Clear call_failed_at badge if set from a previous failed campaign
+                    supabase.from('leads').update({ call_failed_at: null }).eq('id', leadId).catch(() => {});
+                }
+            } else if (finalCampaignLeadStatus === 'failed' && organizationId) {
+                // Only fire call_exhausted if no more queued/active attempts remain for this lead
+                const { count: pendingCount } = await supabase
+                    .from('call_queue')
+                    .select('id', { count: 'exact', head: true })
+                    .eq('lead_id', leadId)
+                    .eq('campaign_id', campaignId)
+                    .in('status', ['queued', 'calling', 'processing']);
+                if (pendingCount === 0) {
+                    firePipelineTrigger(TRIGGER_KEYS.CALL_EXHAUSTED, leadId, organizationId).catch(() => {});
+                    supabase.from('leads')
+                        .update({ call_failed_at: endedAt })
+                        .eq('id', leadId)
+                        .catch(() => {});
+                }
+            }
         }
 
         // Increment campaign credit_spent and auto-pause if cap exceeded

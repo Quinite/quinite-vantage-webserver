@@ -1,5 +1,6 @@
 import { supabase } from '../../services/supabase.js';
 import { plivoClient } from '../../services/plivo.js';
+import { firePipelineTrigger, TRIGGER_KEYS } from '../lib/pipelineTriggers.js';
 
 export async function handleTransfer(plivoWS, realtimeWS, callSid, leadId, campaignId, args, callLogId) {
     // ── 1. Fetch lead + campaign context ─────────────────────────────────────
@@ -114,6 +115,11 @@ export async function handleTransfer(plivoWS, realtimeWS, callSid, leadId, campa
             stat_name: 'transferred_calls',
         }),
     ]);
+
+    // Pipeline trigger — non-blocking
+    if (lead.organization_id) {
+        firePipelineTrigger(TRIGGER_KEYS.CALL_TRANSFERRED, leadId, lead.organization_id).catch(() => {});
+    }
 
     // ── 6. Tear down AI WebSockets ────────────────────────────────────────────
     plivoWS.send(JSON.stringify({ event: 'clearAudio' }));

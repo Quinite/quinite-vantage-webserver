@@ -1,6 +1,7 @@
 import { supabase } from '../../services/supabase.js';
 import { logger } from '../lib/logger.js';
 import { updateLeadProject } from '../lib/updateLeadProject.js';
+import { firePipelineTrigger, TRIGGER_KEYS } from '../lib/pipelineTriggers.js';
 
 export async function handleBookSiteVisit(leadId, organizationId, args, callLogId) {
     const { scheduled_date, scheduled_time, unit_id, notes } = args;
@@ -86,6 +87,9 @@ export async function handleBookSiteVisit(leadId, organizationId, args, callLogI
         minute: '2-digit',
         hour12: true,
     });
+
+    // Pipeline trigger — non-blocking
+    firePipelineTrigger(TRIGGER_KEYS.SITE_VISIT_BOOKED, leadId, organizationId).catch(() => {});
 
     logger.info('Site visit booked via AI call', {
         leadId,
