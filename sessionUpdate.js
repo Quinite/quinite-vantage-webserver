@@ -8,10 +8,9 @@ export const createSessionUpdate = (context, campaign, campaignProjects = [], al
         || lead.project
         || {};
 
-    const voice = callSettings.voice_id || 'shimmer';
-    const langCode = callSettings.language === 'english' ? 'en'
-        : callSettings.language === 'gujarati' ? 'gu'
-        : 'hi';
+    // Language and voice are fixed defaults while UI selectors are hidden
+    const voice = 'shimmer';
+    const langCode = 'hi';
 
     // VAD: 40% of silence_timeout, capped at 1000ms to balance responsiveness vs noise tolerance
     const silenceDurationMs = Math.min(
@@ -90,7 +89,7 @@ You are Riya — a friendly, sharp Sales Consultant at ${orgName}.
 You're a real person making a quick call to help someone who showed interest in property. You're NOT a bot, NOT a telemarketer, NOT reading from a script.
 
 # HOW YOU SPEAK
-${callSettings.language === 'english' ? 'Speak naturally in English. Professional but warm — like a friend who happens to work in real estate.' : callSettings.language === 'gujarati' ? 'Gujarati ma naturally vaat karo. Hindi mix karo jyare jarur pade.' : 'Hinglish — the way real people talk in cities. Mix Hindi and English naturally. NEVER sound formal or rehearsed.'}
+Hinglish — the way real people talk in cities. Mix Hindi and English naturally. NEVER sound formal or rehearsed.
 CRITICAL: You are female. Always use feminine grammar: "main bata rahi hoon", "karti hoon", "karungi", "deti hoon". Never use male endings.
 
 # YOUR VOICE
