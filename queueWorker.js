@@ -9,10 +9,140 @@ dotenv.config();
 const POLL_INTERVAL_MS = 4000;
 const MAX_CONCURRENT_CALLS = 10;
 
+// Track per-campaign credit failure start time (campaignId -> Date)
+const creditFailureSince = new Map();
+
 logger.info('Queue worker starting');
+
+async function markCampaignFailed(campaignId, failReason) {
+    const { data: camp } = await supabase.from('campaigns').select('metadata').eq('id', campaignId).single();
+    const existingMeta = camp?.metadata || {};
+    const { error } = await supabase.from('campaigns').update({
+        status: 'failed',
+        metadata: { ...existingMeta, fail_reason: failReason, failed_at: new Date().toISOString() },
+        updated_at: new Date().toISOString()
+    }).eq('id', campaignId).in('status', ['running', 'paused']);
+    if (!error) {
+        logger.warn('Campaign marked failed', { campaignId, failReason });
+    } else {
+        logger.error('Failed to mark campaign failed', { campaignId, failReason, error: error.message });
+    }
+}
+
+async function checkAllLeadsUnreachable(campaignId) {
+    const TERMINAL_STATUSES = ['called', 'failed', 'skipped', 'opted_out', 'archived'];
+
+    const { data: leads, error } = await supabase
+        .from('campaign_leads')
+        .select('status')
+        .eq('campaign_id', campaignId);
+
+    if (error || !leads?.length) return;
+
+    const allTerminal = leads.every(l => TERMINAL_STATUSES.includes(l.status));
+    if (!allTerminal) return;
+
+    const anySuccess = leads.some(l => l.status === 'called');
+    if (anySuccess) return; // auto-complete will handle it
+
+    await markCampaignFailed(campaignId, 'all_leads_unreachable');
+}
+
+async function checkRunningCampaigns() {
+    const { data: campaigns, error } = await supabase
+        .from('campaigns')
+        .select('id, organization_id, organization:organizations(subscription_status)')
+        .eq('status', 'running');
+
+    if (error || !campaigns?.length) return;
+
+    for (const campaign of campaigns) {
+        const subStatus = campaign.organization?.subscription_status;
+        const orgId = campaign.organization_id;
+
+        // 1. Subscription lapse
+        if (!['active', 'trialing'].includes(subStatus)) {
+            await markCampaignFailed(campaign.id, 'subscription_lapsed');
+            creditFailureSince.delete(campaign.id);
+            continue;
+        }
+
+        // 2. Credit exhaustion sustained for 30 minutes
+        const creditsAvailable = await hasAvailableCredits(orgId);
+        if (!creditsAvailable) {
+            if (!creditFailureSince.has(campaign.id)) {
+                creditFailureSince.set(campaign.id, Date.now());
+            } else if (Date.now() - creditFailureSince.get(campaign.id) >= 30 * 60 * 1000) {
+                await markCampaignFailed(campaign.id, 'credit_exhausted');
+                creditFailureSince.delete(campaign.id);
+                continue;
+            }
+        } else {
+            creditFailureSince.delete(campaign.id);
+        }
+
+        // 3. All leads unreachable with zero successful calls
+        await checkAllLeadsUnreachable(campaign.id);
+    }
+}
+
+async function enqueueNewlyEnrolledLeads() {
+    // Only enqueue leads for running (not paused) campaigns
+    const { data: campaigns, error } = await supabase
+        .from('campaigns')
+        .select('id, organization_id')
+        .eq('status', 'running');
+
+    if (error || !campaigns?.length) return;
+
+    for (const campaign of campaigns) {
+        const { data: leads, error: leadsError } = await supabase
+            .from('campaign_leads')
+            .select('lead_id')
+            .eq('campaign_id', campaign.id)
+            .eq('status', 'enrolled');
+
+        if (leadsError || !leads?.length) continue;
+
+        for (const { lead_id } of leads) {
+            // Check if already in queue
+            const { data: existing } = await supabase
+                .from('call_queue')
+                .select('id')
+                .eq('campaign_id', campaign.id)
+                .eq('lead_id', lead_id)
+                .in('status', ['queued', 'processing', 'failed'])
+                .maybeSingle();
+
+            if (existing) continue;
+
+            const { error: insertError } = await supabase.from('call_queue').insert({
+                campaign_id: campaign.id,
+                lead_id,
+                organization_id: campaign.organization_id,
+                status: 'queued',
+                attempt_count: 0,
+                next_retry_at: new Date().toISOString(),
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString()
+            });
+
+            if (insertError) {
+                logger.error('Failed to enqueue enrolled lead', { campaignId: campaign.id, lead_id, error: insertError.message });
+            } else {
+                await supabase.from('campaign_leads').update({ status: 'queued', updated_at: new Date().toISOString() })
+                    .match({ campaign_id: campaign.id, lead_id });
+                logger.info('Enrolled lead enqueued', { campaignId: campaign.id, lead_id });
+            }
+        }
+    }
+}
 
 async function processQueue() {
     try {
+        await enqueueNewlyEnrolledLeads();
+        await checkRunningCampaigns();
+
         const now = new Date().toISOString();
 
         const { data: rawItems, error } = await supabase

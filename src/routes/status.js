@@ -23,8 +23,8 @@ async function handleFailedCall(campaignId, leadId, callLogId, endedAt, callStat
     if (hasRetries) {
         const nextRetryAt = new Date(Date.now() + attempts * RETRY_DELAY_MS).toISOString();
 
-        // Re-insert a retry entry into call_queue
-        await supabase.from('call_queue').insert({
+        // Re-insert or update the retry entry into call_queue
+        await supabase.from('call_queue').upsert({
             campaign_id: campaignId,
             lead_id: leadId,
             organization_id: cl?.organization_id || null,
@@ -32,7 +32,7 @@ async function handleFailedCall(campaignId, leadId, callLogId, endedAt, callStat
             attempt_count: attempts,
             last_error: callStatus,
             next_retry_at: nextRetryAt,
-        });
+        }, { onConflict: 'campaign_id,lead_id' });
 
         // Keep campaign_leads as 'queued' so the auto-complete trigger doesn't fire
         await supabase.from('campaign_leads')
@@ -73,7 +73,7 @@ router.all('/', async (req, res) => {
 
     if (!CallUUID || !CallStatus) return;
 
-    const callStatus = CallStatus.toLowerCase().replace(/_/g, '-');
+    const callStatus = CallStatus.toLowerCase().replace(/-/g, '_');
     logger.info('Plivo status callback', { CallUUID, callStatus, Duration, leadId, campaignId });
 
     if (!TERMINAL_STATUSES.has(callStatus)) return;
@@ -165,7 +165,7 @@ router.all('/', async (req, res) => {
             });
         }
 
-        await handleFailedCall(campaignId, leadId, null, endedAt, callStatus);
+        await handleFailedCall(campaignId, leadId, newLog?.id, endedAt, callStatus);
     }
 });
 
