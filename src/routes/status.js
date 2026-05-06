@@ -145,6 +145,7 @@ router.all('/', async (req, res) => {
             .eq('id', leadId)
             .maybeSingle();
 
+        let createdLogId = null;
         if (camp) {
             const { data: newLog } = await supabase.from('call_logs').insert({
                 organization_id: camp.organization_id,
@@ -160,12 +161,14 @@ router.all('/', async (req, res) => {
                 disconnect_reason: callStatus,
             }).select('id').maybeSingle();
 
+            createdLogId = newLog?.id;
+
             logger.info('status webhook: created missing call_log for failed call', {
-                CallUUID, callStatus, leadId, campaignId, callLogId: newLog?.id,
+                CallUUID, callStatus, leadId, campaignId, callLogId: createdLogId,
             });
         }
 
-        await handleFailedCall(campaignId, leadId, newLog?.id, endedAt, callStatus);
+        await handleFailedCall(campaignId, leadId, createdLogId, endedAt, callStatus);
     }
 });
 
