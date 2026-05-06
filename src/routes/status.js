@@ -17,7 +17,9 @@ async function handleFailedCall(campaignId, leadId, callLogId, endedAt, callStat
         .match({ campaign_id: campaignId, lead_id: leadId })
         .maybeSingle();
 
-    const attempts = (cl?.attempt_count || 0) + 1;
+    // attempt_count on campaign_leads was already incremented by queueWorker at dispatch time.
+    // Do not increment again here — just use the current value to decide whether to retry.
+    const attempts = cl?.attempt_count || 0;
     const hasRetries = attempts < MAX_ATTEMPTS;
 
     if (hasRetries) {
@@ -38,7 +40,6 @@ async function handleFailedCall(campaignId, leadId, callLogId, endedAt, callStat
         await supabase.from('campaign_leads')
             .update({
                 status: 'queued',
-                attempt_count: attempts,
                 ...(callLogId ? { call_log_id: callLogId } : {}),
                 last_call_attempt_at: endedAt,
                 updated_at: endedAt,
@@ -52,7 +53,6 @@ async function handleFailedCall(campaignId, leadId, callLogId, endedAt, callStat
         await supabase.from('campaign_leads')
             .update({
                 status: 'failed',
-                attempt_count: attempts,
                 ...(callLogId ? { call_log_id: callLogId } : {}),
                 last_call_attempt_at: endedAt,
                 updated_at: endedAt,
