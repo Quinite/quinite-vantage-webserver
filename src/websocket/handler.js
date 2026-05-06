@@ -134,16 +134,18 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                 // Plivo 'start' is only needed before audio can flow, not for session setup.
                 await sendSessionUpdate(realtimeWS, context, campaign, campaignProjects, callSid);
 
-                // Wait for Plivo stream + DB log in parallel, then trigger AI greeting.
-                const [resolvedCallLogId] = await Promise.all([
-                    logCallStart(context, campaign, callSid),
-                    plivoWS.startPromise
-                ]);
-                callLogId = resolvedCallLogId;
+                // Wait for Plivo stream ready, then fire greeting immediately.
+                // logCallStart runs in parallel — DB write must not block the first word.
+                await plivoWS.startPromise;
                 callStartTime = Date.now();
 
                 realtimeWS.send(JSON.stringify({ type: 'response.create' }));
                 resetSilenceTimer();
+
+                // Resolve call log ID in background; tools that need it will find it set.
+                logCallStart(context, campaign, callSid).then(id => { callLogId = id; }).catch(err => {
+                    logger.error('logCallStart failed', { callSid, error: err.message });
+                });
 
                 // Prevent idle connection drops on cloud proxies
                 keepalive = setInterval(() => {

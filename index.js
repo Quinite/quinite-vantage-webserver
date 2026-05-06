@@ -70,7 +70,7 @@ wss.on('connection', async (plivoWS, request) => {
 
     plivoWS.startPromise = new Promise((resolve) => {
         plivoWS.resolveStart = resolve;
-        setTimeout(resolve, 5000); // Safety timeout if Plivo start event is delayed
+        setTimeout(resolve, 500); // Safety timeout if Plivo start event is delayed
     });
 
     plivoWS.on('message', (message) => {
