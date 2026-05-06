@@ -218,14 +218,14 @@ export async function finalizeCallOutcome(callLogId, leadId, campaignId, transcr
             }
         }
 
-        // Non-blocking sentiment analysis — skip for very short calls where the user never spoke
-        analyzeSentiment(transcript, leadId, callLogId, organizationId, callSid, campaignId, durationSecs);
+        // Sentiment analysis — skip for very short calls where the user never spoke
+        await analyzeSentiment(transcript, leadId, callLogId, organizationId, callSid, campaignId, durationSecs);
 
     } catch (err) {
-        logger.error('finalizeCallOutcome failed', { callSid, error: err.message });
+        logger.error('Sentiment analysis failed', { callSid, error: err.message, stack: err.stack });
+        return null;
     }
 }
-
 // Check available credits before initiating a call
 export async function hasAvailableCredits(organizationId, supabaseClient = supabase) {
     const { data } = await supabaseClient

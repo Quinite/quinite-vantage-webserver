@@ -9,18 +9,29 @@ dotenv.config();
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 export async function analyzeSentiment(transcript, leadId, callLogId, organizationId, callSid, campaignId, durationSecs = 0) {
-    if (!transcript || transcript.length < 50) return null;
+    if (!transcript || transcript.length < 50) {
+        logger.info('Skipping sentiment — transcript too short', { callSid, length: transcript?.length });
+        return null;
+    }
 
     // Require the user to have actually spoken — AI-only transcripts produce false positives
-    const userLines = transcript.split('\n').filter(l => l.startsWith('User:'));
-    const userWordCount = userLines.join(' ').split(/\s+/).filter(Boolean).length;
+    // More robust regex for User lines: case-insensitive, allows space before colon
+    const userLineRegex = /^\s*User\s*:\s*/i;
+    const userLines = transcript.split('\n').filter(l => userLineRegex.test(l));
+    
+    // Calculate word count excluding the "User:" prefix
+    const userWordCount = userLines
+        .map(l => l.replace(userLineRegex, ''))
+        .join(' ')
+        .split(/\s+/)
+        .filter(Boolean).length;
 
-    if (userWordCount < 5 || durationSecs < 20) {
-        logger.info('Skipping sentiment — call too short or user did not speak', { callSid, durationSecs, userWordCount });
+    if (userWordCount < 3 || durationSecs < 15) {
+        logger.info('Skipping sentiment — call too short or user did not speak enough', { callSid, durationSecs, userWordCount });
         // Write conservative defaults so the UI doesn't show blank or misleading data
         const { data: existingLog } = await supabase.from('call_logs').select('ai_metadata').eq('id', callLogId).single();
         await supabase.from('call_logs').update({
-            summary: 'Call ended before conversation could begin.',
+            summary: userWordCount === 0 ? 'Call ended without user response.' : 'Call ended before meaningful conversation.',
             sentiment_score: 0,
             interest_level: 'none',
             ai_metadata: { ...(existingLog?.ai_metadata || {}), priority_score: 0 }
@@ -30,7 +41,7 @@ export async function analyzeSentiment(transcript, leadId, callLogId, organizati
     }
 
     try {
-        logger.info('Running sentiment analysis', { callSid });
+        logger.info('Running sentiment analysis', { callSid, userWordCount, durationSecs });
 
         const completion = await openai.chat.completions.create({
             model: 'gpt-4o-mini',
@@ -64,20 +75,20 @@ Return JSON only:
             (sentimentUsage.completion_tokens || 0) / 1_000_000 * 0.60
         ).toFixed(6));
 
-        // Fetch existing ai_metadata + usage_telemetry to merge
-        const { data: existingLog } = await supabase.from('call_logs')
+        // Fetch latest state to avoid overwriting usage_telemetry from concurrent status webhooks
+        const { data: latestLog } = await supabase.from('call_logs')
             .select('ai_metadata, usage_telemetry').eq('id', callLogId).single();
 
         const mergedMeta = {
-            ...(existingLog?.ai_metadata || {}),
+            ...(latestLog?.ai_metadata || {}),
             objections: analysis.objections,
             budget_estimated: analysis.budget,
             priority_score: analysis.priority,
             key_takeaways: analysis.key_takeaways,
         };
 
-        const mergedPlatformMeta = {
-            ...(existingLog?.usage_telemetry || {}),
+        const mergedUsage = {
+            ...(latestLog?.usage_telemetry || {}),
             sentiment_analysis: {
                 prompt_tokens:     sentimentUsage.prompt_tokens     || 0,
                 completion_tokens: sentimentUsage.completion_tokens || 0,
@@ -86,18 +97,20 @@ Return JSON only:
             },
         };
 
-        await supabase.from('call_logs').update({
+        const { error: updateError } = await supabase.from('call_logs').update({
             summary: analysis.summary,
-            sentiment_score: analysis.sentiment_score,
-            interest_level: analysis.interest_level,
+            sentiment_score: analysis.sentiment_score ?? 0,
+            interest_level: analysis.interest_level || 'none',
             ai_metadata: mergedMeta,
-            usage_telemetry: mergedPlatformMeta,
+            usage_telemetry: mergedUsage,
         }).eq('id', callLogId);
+
+        if (updateError) throw updateError;
 
         // Update lead with AI-derived behavioral signals
         await supabase.from('leads').update({
-            interest_level: analysis.interest_level,
-            score: Math.round(analysis.priority),
+            interest_level: analysis.interest_level || 'none',
+            score: Math.round(analysis.priority || 0),
         }).eq('id', leadId);
 
         // Auto-update lead's project if logIntent captured a different interested project
@@ -116,7 +129,7 @@ Return JSON only:
         return analysis;
 
     } catch (err) {
-        logger.error('Sentiment analysis failed', { callSid, error: err.message });
+        logger.error('Sentiment analysis failed', { callSid, error: err.message, stack: err.stack });
         return null;
     }
 }

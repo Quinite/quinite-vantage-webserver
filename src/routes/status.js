@@ -108,10 +108,12 @@ router.all('/', async (req, res) => {
         // Merge Plivo's reported cost into usage_telemetry (always, regardless of call_status)
         if (TotalCost != null) {
             const plivoCostUsd = parseFloat(TotalCost) || 0;
-            const { data: existing } = await supabase.from('call_logs')
+            // Fetch latest state to avoid overwriting sentiment analysis results
+            const { data: latestLog } = await supabase.from('call_logs')
                 .select('usage_telemetry').eq('id', callLog.id).single();
+            
             await supabase.from('call_logs')
-                .update({ usage_telemetry: { ...(existing?.usage_telemetry || {}), plivo_cost_usd: plivoCostUsd } })
+                .update({ usage_telemetry: { ...(latestLog?.usage_telemetry || {}), plivo_cost_usd: plivoCostUsd } })
                 .eq('id', callLog.id);
             logger.info('status webhook: plivo cost recorded', { callLogId: callLog.id, plivoCostUsd });
         }
