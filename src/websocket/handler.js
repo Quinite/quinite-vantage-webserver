@@ -125,6 +125,10 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
             // error always precedes close, so cleanup will run via the 'close' handler
         });
 
+        // Resolves when OpenAI confirms session config is applied
+        let resolveSessionReady;
+        const sessionReadyPromise = new Promise(r => { resolveSessionReady = r; });
+
         realtimeWS.on('open', async () => {
             try {
                 clearTimeout(startupTimeout);
@@ -134,16 +138,27 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                 // Plivo 'start' is only needed before audio can flow, not for session setup.
                 await sendSessionUpdate(realtimeWS, context, campaign, campaignProjects, callSid);
 
-                // Wait for Plivo stream ready, then fire greeting immediately.
-                // logCallStart runs in parallel — DB write must not block the first word.
-                await plivoWS.startPromise;
+                // Wait for both: Plivo stream ready AND OpenAI session.updated confirmation.
+                // This eliminates the initial silence — response.create is only sent once
+                // OpenAI has fully applied the session config and audio is flowing from Plivo.
+                await Promise.all([plivoWS.startPromise, sessionReadyPromise]);
                 callStartTime = Date.now();
 
                 realtimeWS.send(JSON.stringify({ type: 'response.create' }));
                 resetSilenceTimer();
 
                 // Resolve call log ID in background; tools that need it will find it set.
-                logCallStart(context, campaign, callSid).then(id => { callLogId = id; }).catch(err => {
+                logCallStart(context, campaign, callSid).then(id => {
+                    callLogId = id;
+                    // Record the actual conversation start time so the live calls page
+                    // can show accurate duration (call_logs.created_at is pre-connection).
+                    if (id) {
+                        supabase.from('call_logs')
+                            .update({ metadata: { started_at: new Date(callStartTime).toISOString() } })
+                            .eq('id', id)
+                            .catch(() => {});
+                    }
+                }).catch(err => {
                     logger.error('logCallStart failed', { callSid, error: err.message });
                 });
 
@@ -168,6 +183,10 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                 resetSilenceTimer();
 
                 switch (response.type) {
+                    case 'session.updated':
+                        resolveSessionReady();
+                        break;
+
                     case 'response.function_call_arguments.done': {
                         const { name, arguments: argsJson, call_id } = response;
                         const args = JSON.parse(argsJson);
