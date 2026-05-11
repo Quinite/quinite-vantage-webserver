@@ -28,12 +28,16 @@ export const createSessionUpdate = (context, campaign, campaignProjects = [], al
             count: 0,
             minPrice: null,
             maxPrice: null,
+            floorCounts: {}, // { floorNumber: count } — lets AI answer "X floor pe kya hai" exactly
         });
         entry.count++;
         const price = !u.price_undisclosed && (u.total_price || u.base_price) || null;
         if (price) {
             if (entry.minPrice == null || price < entry.minPrice) entry.minPrice = price;
             if (entry.maxPrice == null || price > entry.maxPrice) entry.maxPrice = price;
+        }
+        if (u.floor_number != null) {
+            entry.floorCounts[u.floor_number] = (entry.floorCounts[u.floor_number] || 0) + 1;
         }
     }
 
@@ -138,7 +142,7 @@ export const createSessionUpdate = (context, campaign, campaignProjects = [], al
     // yourself + the project + reason for call) ALWAYS comes first, no matter the flow mode.
     const flowInstruction = flowMode === 'WARM_KNOWN'
         ? `STEP 1 — Deliver the OPENING greeting verbatim (see # OPENING above). This is your VERY FIRST turn. Do NOT skip it. Do NOT jump into preferences without greeting first.
-STEP 2 — After they acknowledge the greeting (or stay silent), confirm what you know about them in ONE short line, e.g. "Aap ${lead.preferred_configuration || 'property'} dekh rahe the ${lead.preferred_location || primaryProject.locality || ''} mein${lead.budget_range ? `, budget around ${lead.budget_range}` : ''} — still looking?". You can SKIP re-asking purpose/budget/timeline.
+STEP 2 — After they acknowledge the greeting (or stay silent), confirm what you know in ONE short line and ask if they're still exploring. Phrase it in the lead's language. Hinglish example: "Aap ${lead.preferred_configuration || 'property'} dekh rahe the ${lead.preferred_location || primaryProject.locality || ''} mein${lead.budget_range ? `, budget around ${lead.budget_range}` : ''} — abhi bhi dekh rahe ho ya finalize ho gaya?" (in English: "...are you still exploring or have you finalized?"; in Gujarati: "...have hajee joi rahya cho ke nakki kari lidhu?"). SKIP re-asking purpose/budget/timeline.
 STEP 3 — Based on their reply, move to inventory check (call check_detailed_inventory) or directly to site visit CTA.`
         : flowMode === 'WARM_PARTIAL'
             ? `STEP 1 — Deliver the OPENING greeting (see # OPENING above). This is your VERY FIRST turn. Do NOT skip it.
@@ -163,8 +167,9 @@ After EACH answer call log_intent silently. After timeline, pitch the most relev
         if (p.rera_number) lines.push(`  RERA: ${p.rera_number}`);
         if (p.amenities) lines.push(`  Amenities: ${Array.isArray(p.amenities) ? p.amenities.join(', ') : p.amenities}`);
 
-        // Available units in this project — grouped by config/property_type/category, with live counts.
-        // This is the source of truth the AI uses to answer "villa hai kya / 3BHK hai kya / shop hai kya".
+        // Available units in this project — grouped by config/property_type/category.
+        // Each bucket lists EXACT count per floor so the AI can answer floor-specific questions truthfully
+        // (e.g. "5th floor pe 3BHK hai kya?" → check the floors list in that config's bucket).
         const buckets = Object.values(unitsByProject[p.id] || {});
         if (buckets.length) {
             const summary = buckets.map(b => {
@@ -176,7 +181,17 @@ After EACH answer call log_intent silently. After timeline, pitch the most relev
                 let price = '';
                 if (b.minPrice && b.maxPrice && b.minPrice !== b.maxPrice) price = ` from ${formatMoney(b.minPrice)} to ${formatMoney(b.maxPrice)}`;
                 else if (b.minPrice) price = ` from ${formatMoney(b.minPrice)}`;
-                return `${b.count}× ${tag}${price}`;
+                // List floors with available unit counts: "floor 3 (1 unit), floor 7 (2 units)" — capped to keep prompt small
+                const floorEntries = Object.entries(b.floorCounts || {})
+                    .map(([f, c]) => [Number(f), c])
+                    .sort((a, b) => a[0] - b[0]);
+                let floors = '';
+                if (floorEntries.length) {
+                    const display = floorEntries.slice(0, 12).map(([f, c]) => c > 1 ? `floor ${f} (${c})` : `floor ${f}`).join(', ');
+                    const more = floorEntries.length > 12 ? ` (+${floorEntries.length - 12} more)` : '';
+                    floors = ` on ${display}${more}`;
+                }
+                return `${b.count}× ${tag}${price}${floors}`;
             }).join('; ');
             lines.push(`  Available Units: ${summary}`);
         } else if (campaignUnits.length) {
@@ -346,6 +361,8 @@ ${campaign?.ai_script || 'Help the lead find their ideal property. Be genuine, h
 9. RERA: if listed, share. If not, "Verify karke bhejti hoon."
 10. End every completed call: spoken goodbye → disconnect_call. Never leave the call hanging.
 11. Match the lead's language (English / Hindi / Gujarati / other) from turn 2 onwards. Turn 1 is always Hinglish.
+12. Treat the example sentences in this prompt as templates, not lines to copy verbatim. ALWAYS phrase your reply in the lead's CURRENT language — never leave English fragments like "still looking", "right", "okay" inside a Hindi/Gujarati reply (use "abhi bhi dekh rahe ho", "theek hai", "haan ji" instead).
+13. When the lead asks about FLOORS ("X floor pe hai kya", "kaunse floor available hain"): answer ONLY from the floor list in the Available Units summary for the relevant project above. If a floor isn't in that list for the config they want, say honestly "us floor pe abhi available nahi hai, [list available floors] pe options hain". For specific unit details (facing, unit number, exact area), call check_detailed_inventory — do not guess.
 `.trim();
 
     return {
