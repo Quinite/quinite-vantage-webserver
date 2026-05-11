@@ -55,6 +55,12 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
         // backchannel affirmations like "haa", "acha", "hmm" common in Indian conversations.
         let cancelDebounce = null;
 
+        // Shared context lifted to the outer scope so the message handler (registered
+        // outside the open handler) can access them when dispatching tool calls.
+        let organization = null;
+        let campaignProjectIds = [];
+        let leadHints = {};
+
         // Accumulated OpenAI Realtime token usage across all response.done events this call
         const realtimeUsage = {
             input_text_tokens: 0, input_audio_tokens: 0,
@@ -131,8 +137,8 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
 
                 const campaign = campaignData;
                 silenceTimeoutMs = (campaign.call_settings?.silence_timeout || 15) * 1000;
-                
-                const organization = campaign.organization;
+
+                organization = campaign.organization;
                 const credits = organization?.call_credits;
                 const balance = Array.isArray(credits) ? parseFloat(credits[0]?.balance || 0) : parseFloat(credits?.balance || 0);
 
@@ -149,7 +155,17 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                 if (campaignProjects.length === 0 && campaign.project_id) {
                     campaignProjects = [context.project].filter(Boolean);
                 }
-                const campaignProjectIds = campaignProjects.map(p => p.id);
+                campaignProjectIds = campaignProjects.map(p => p.id);
+
+                // Snapshot lead preferences for the inventory tool's relevance ranking
+                leadHints = {
+                    preferred_configuration: context.preferred_configuration,
+                    preferred_category: context.preferred_category,
+                    preferred_location: context.preferred_location,
+                    min_budget: context.min_budget,
+                    max_budget: context.max_budget,
+                    preferred_timeline: context.preferred_timeline,
+                };
 
                 // 3. Org projects were already fetching in parallel — just await the result.
                 const allOrgProjects = await orgProjectsPromise;
@@ -204,7 +220,11 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                         const { name, arguments: argsJson, call_id } = response;
                         const args = JSON.parse(argsJson);
 
-                        // Mid-call credit pulse check
+                        // Mid-call credit pulse check (skip if context not yet ready)
+                        if (!organization?.id) {
+                            logger.warn('Tool call before context ready', { callSid, tool: name });
+                            break;
+                        }
                         const { data: creditPulse } = await supabase.from('call_credits').select('balance').eq('organization_id', organization.id).single();
                         if (!creditPulse || creditPulse.balance < 0.1) {
                             realtimeWS.send(JSON.stringify({
@@ -217,7 +237,7 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
 
                         let result;
                         try {
-                            result = await dispatchTool(name, args, { plivoWS, realtimeWS, callSid, leadId, campaignId, callLogId, organizationId: organization.id, campaignProjectIds });
+                            result = await dispatchTool(name, args, { plivoWS, realtimeWS, callSid, leadId, campaignId, callLogId, organizationId: organization?.id, campaignProjectIds, leadHints });
                         } catch (err) {
                             logger.error('Tool dispatch error', { callSid, tool: name, error: err.message });
                             result = { success: false, error: err.message };

@@ -2,7 +2,7 @@ import { supabase } from '../../services/supabase.js';
 import { logger } from '../lib/logger.js';
 
 export async function handleDetailedInventory(leadId, args, context = {}) {
-    const { campaignProjectIds = [] } = context;
+    const { campaignProjectIds = [], leadHints = {} } = context;
     let targetProjectId = null;
 
     // 1. Explicit project_id from AI (security: must be a campaign project)
@@ -135,16 +135,38 @@ export async function handleDetailedInventory(leadId, args, context = {}) {
         if (areaFiltered.length) filtered = areaFiltered;
     }
 
-    const top5 = filtered.slice(0, 5);
-    const wasFiltered = top5.length < units.length && filtered.length === units.length && args.config_name;
+    // Rank by closeness to lead preferences (passed in via context.leadHints from handler).
+    // Higher score = better match. Stable sort: ties keep original DB order.
+    const scoreUnit = (u) => {
+        let s = 0;
+        const reasons = [];
+        const cfg = u.config?.config_name?.replace(/\s/g, '').toLowerCase();
+        const leadCfg = leadHints.preferred_configuration?.replace(/\s/g, '').toLowerCase();
+        if (leadCfg && cfg && cfg.includes(leadCfg)) { s += 10; reasons.push(`matches preferred ${leadHints.preferred_configuration}`); }
+        if (leadHints.preferred_category && u.config?.category?.toLowerCase() === leadHints.preferred_category.toLowerCase()) { s += 5; reasons.push('matches category'); }
+        const price = u.total_price || u.base_price || 0;
+        if (leadHints.max_budget && price && price <= leadHints.max_budget) { s += 5; reasons.push('within budget'); }
+        if (leadHints.min_budget && price && price >= leadHints.min_budget) { s += 2; }
+        return { score: s, reason: reasons[0] || null };
+    };
+    const ranked = filtered
+        .map(u => ({ unit: u, ...scoreUnit(u) }))
+        .sort((a, b) => b.score - a.score);
 
-    logger.info('Inventory result', { leadId, dbCount: units.length, filteredCount: filtered.length, returning: top5.length });
+    const topN = ranked.slice(0, 5);
+    const wasFiltered = topN.length < units.length && filtered.length === units.length && args.config_name;
+
+    logger.info('Inventory result', { leadId, dbCount: units.length, filteredCount: filtered.length, returning: topN.length, topScore: topN[0]?.score });
 
     return {
         available: true,
         total_available: filtered.length,
         ...(wasFiltered && { note: 'Exact BHK match nahi mila — ye closest available units hain.' }),
-        units: top5.map(u => formatUnit(u))
+        units: topN.map((entry, i) => ({
+            ...formatUnit(entry.unit),
+            match_rank: i + 1,
+            ...(entry.reason && { match_reason: entry.reason })
+        }))
     };
 }
 
