@@ -1,5 +1,41 @@
-export const createSessionUpdate = (context, campaign, campaignProjects = [], allOrgProjects = []) => {
+export const createSessionUpdate = (context, campaign, campaignProjects = [], allOrgProjects = [], campaignUnits = []) => {
     const lead = context;
+
+    // Group ACTUAL available units by project_id, then by their config bucket.
+    // Units are the source of truth for availability — unit_configs are just templates,
+    // so we only treat a config as "offered" if at least one available unit references it.
+    //
+    // Shape per project: { 'config_name | property_type | category' : { label, count, minPrice, maxPrice } }
+    const unitsByProject = {};
+    const allCategories = new Set();
+    const allPropertyTypes = new Set();
+    const allConfigNames = new Set();
+    for (const u of campaignUnits) {
+        if (!u.project_id) continue;
+        const cat = u.config?.category?.toLowerCase();
+        const ptype = u.config?.property_type?.toLowerCase();
+        const cname = u.config?.config_name;
+        if (cat) allCategories.add(cat);
+        if (ptype) allPropertyTypes.add(ptype);
+        if (cname) allConfigNames.add(cname);
+
+        const key = `${cname || '-'}|${ptype || '-'}|${cat || '-'}`;
+        const bucket = (unitsByProject[u.project_id] ||= {});
+        const entry = (bucket[key] ||= {
+            config_name: cname || null,
+            property_type: ptype || null,
+            category: cat || null,
+            count: 0,
+            minPrice: null,
+            maxPrice: null,
+        });
+        entry.count++;
+        const price = !u.price_undisclosed && (u.total_price || u.base_price) || null;
+        if (price) {
+            if (entry.minPrice == null || price < entry.minPrice) entry.minPrice = price;
+            if (entry.maxPrice == null || price > entry.maxPrice) entry.maxPrice = price;
+        }
+    }
 
     // Primary project: lead's own if it's in campaign projects, else first campaign project, else lead's project
     const primaryProject = campaignProjects.find(p => p.id === lead.project_id)
@@ -66,21 +102,29 @@ export const createSessionUpdate = (context, campaign, campaignProjects = [], al
         : hasProject ? 'WARM_PARTIAL'
         : 'COLD';
 
-    // Preference-mismatch detection: does the lead's preferred location/property type
-    // match anything in the campaign projects? If not, the AI should be honest about it.
+    // Preference-mismatch detection — now uses real unit_configs data, not guessing.
     const leadLocNorm = lead.preferred_location?.toLowerCase().trim();
     const leadPropTypeNorm = lead.preferred_property_type?.toLowerCase().trim();
     const leadCategoryNorm = lead.preferred_category?.toLowerCase().trim();
+    const leadConfigNorm = lead.preferred_configuration?.replace(/\s/g, '').toLowerCase();
+
     const locationMatches = !leadLocNorm || campaignProjects.some(p =>
         (p.locality && p.locality.toLowerCase().includes(leadLocNorm)) ||
         (p.city && p.city.toLowerCase().includes(leadLocNorm)) ||
         (p.address && p.address.toLowerCase().includes(leadLocNorm))
     );
-    // We can't fully verify property_type / category match without unit_configs, so we only
-    // flag mismatch when the location is clearly off (most common lead frustration).
-    const preferenceMismatch = !locationMatches && hasProject;
-    const mismatchNote = preferenceMismatch
-        ? `\n\n# PREFERENCE MISMATCH FLAG\nThe lead's preferred location ("${lead.preferred_location}") does NOT match any of the projects in this campaign (${campaignProjects.map(p => `${p.name} in ${p.locality || p.city || '?'}`).join(', ')}). BE HONEST. Acknowledge this upfront — do NOT pitch a wrong-location project as if it matches. Say something like: "Aap ${lead.preferred_location} mein dekh rahe the, but abhi humare paas wahan koi project nahi hai. ${campaignProjects[0]?.locality || campaignProjects[0]?.city || 'Other locations'} mein humare paas options hain — interested ho toh batati hoon?" If they say no, offer WhatsApp brochure or politely close.`
+    const propTypeMatches = !leadPropTypeNorm || [...allPropertyTypes].some(pt => pt.includes(leadPropTypeNorm) || leadPropTypeNorm.includes(pt));
+    const categoryMatches = !leadCategoryNorm || allCategories.has(leadCategoryNorm);
+    const configMatches = !leadConfigNorm || [...allConfigNames].some(cn => cn.replace(/\s/g, '').toLowerCase().includes(leadConfigNorm));
+
+    const mismatches = [];
+    if (!locationMatches) mismatches.push(`Location: lead wants "${lead.preferred_location}", but campaign projects are in ${campaignProjects.map(p => p.locality || p.city || '?').filter(Boolean).join(' / ') || 'different locations'}`);
+    if (!propTypeMatches) mismatches.push(`Property type: lead wants "${lead.preferred_property_type}", but campaign offers ${[...allPropertyTypes].join(', ') || 'no matching types'}`);
+    if (!categoryMatches) mismatches.push(`Category: lead wants "${lead.preferred_category}", but campaign has ${[...allCategories].join(', ') || 'different categories'}`);
+    if (!configMatches && allConfigNames.size > 0) mismatches.push(`Configuration: lead wants "${lead.preferred_configuration}", but campaign has ${[...allConfigNames].join(', ')}`);
+
+    const mismatchNote = mismatches.length && hasProject
+        ? `\n\n# PREFERENCE MISMATCH FLAG (BE HONEST WITH THE LEAD)\n${mismatches.map(m => `- ${m}`).join('\n')}\nDo NOT pitch projects/types you don't actually have. Acknowledge what's missing, then pivot to what IS available: "Aap ${[lead.preferred_configuration, lead.preferred_property_type].filter(Boolean).join(' ')} dekh rahe the, but abhi humare campaign mein woh exact option nahi hai. Humare paas [list what's available] hai — interested ho toh batati hoon?" If they say no, offer WhatsApp brochure or politely close.`
         : '';
 
     // Price hint: prefer project range, fall back to first unit_config base_price if seeded later (here just project)
@@ -118,6 +162,27 @@ After EACH answer call log_intent silently. After timeline, pitch the most relev
         if (p.description) lines.push(`  About: ${p.description}`);
         if (p.rera_number) lines.push(`  RERA: ${p.rera_number}`);
         if (p.amenities) lines.push(`  Amenities: ${Array.isArray(p.amenities) ? p.amenities.join(', ') : p.amenities}`);
+
+        // Available units in this project — grouped by config/property_type/category, with live counts.
+        // This is the source of truth the AI uses to answer "villa hai kya / 3BHK hai kya / shop hai kya".
+        const buckets = Object.values(unitsByProject[p.id] || {});
+        if (buckets.length) {
+            const summary = buckets.map(b => {
+                const parts = [];
+                if (b.config_name) parts.push(b.config_name);
+                if (b.property_type) parts.push(b.property_type);
+                if (b.category && b.category !== 'residential') parts.push(`(${b.category})`);
+                const tag = parts.filter(Boolean).join(' ').trim() || 'unit';
+                let price = '';
+                if (b.minPrice && b.maxPrice && b.minPrice !== b.maxPrice) price = ` from ${formatMoney(b.minPrice)} to ${formatMoney(b.maxPrice)}`;
+                else if (b.minPrice) price = ` from ${formatMoney(b.minPrice)}`;
+                return `${b.count}× ${tag}${price}`;
+            }).join('; ');
+            lines.push(`  Available Units: ${summary}`);
+        } else if (campaignUnits.length) {
+            // We have unit data for other projects in this campaign but zero available units in this one.
+            lines.push(`  Available Units: none currently available — all booked or unconfigured. If lead asks, say so honestly.`);
+        }
         return lines.join('\n');
     };
 
@@ -128,6 +193,13 @@ After EACH answer call log_intent silently. After timeline, pitch the most relev
     const campaignScopeText = campaignProjects.length > 1
         ? `You represent ${campaignProjects.length} projects in this campaign:\n${campaignProjects.map((p, i) => `${i + 1}. ${p.name} (${p.locality || p.city || ''})`).join('\n')}\nLead's registered project: ${primaryProject.name || 'one of our projects'}. Start with their project but naturally mention others if they seem interested in options or comparisons.`
         : `You represent: ${primaryProject.name || 'Our Project'}`;
+
+    // Campaign-wide capability summary — answers "do you have villa / shop / 3BHK?" instantly.
+    // Sourced from ACTUAL available units, not config blueprints. If a property_type isn't listed
+    // here, it means there are zero available units of that type across the entire campaign.
+    const capabilitySummary = campaignUnits.length
+        ? `Property types currently available in this campaign: ${[...allPropertyTypes].join(', ') || 'none'}\nCategories: ${[...allCategories].join(', ') || 'none'}\nConfigurations: ${[...allConfigNames].join(', ') || 'none'}\nTotal available units across the campaign: ${campaignUnits.length}`
+        : `No available units found across the campaign projects right now. If lead asks about specific availability (villa/shop/BHK), call check_detailed_inventory to confirm — and if it returns empty, tell the lead honestly that inventory is currently sold out / not configured.`;
 
     const systemInstructions = `
 # WHO YOU ARE
@@ -182,7 +254,10 @@ For the FIRST turn always use the Hinglish opening — you haven't heard the lea
 # CAMPAIGN SCOPE
 ${campaignScopeText}
 
-# PROJECT INFO
+# WHAT THIS CAMPAIGN OFFERS (use this to answer availability questions truthfully)
+${capabilitySummary}
+
+# PROJECT INFO (each project's available configs are listed inline)
 ${campaignProjectsText}${prefsText}${mismatchNote}
 
 # CONVERSATION FLOW — based on what we know about THIS lead
@@ -195,8 +270,20 @@ ${flowMode === 'WARM_KNOWN'
 English: "Are you currently exploring property — for investment or personal use?"
 Gujarati: "Tame at-yare property joi rahya cho — investment mate ke personal use mate?"`}
 
+# ANSWERING THE LEAD'S QUESTIONS — be a domain expert, not a brochure delivery service
+When the lead asks ANY question (price, area, BHK, location, possession, builder, loan, RERA, amenities, "kya available hai", "villa hai kya", "shop hai kya"):
+1. ANSWER IT FIRST using the PROJECT INFO and WHAT THIS CAMPAIGN OFFERS above. Give the actual answer in one short sentence.
+2. If you need fresh availability data, call check_detailed_inventory — but FIRST say "Ek minute, check karke batati hoon" out loud so the lead doesn't hear silence.
+3. DO NOT respond to questions with "main brochure bhej deti hoon". Brochure is a CTA reserved for end-of-call, declined-site-visit, family-decision, or "sochna hai" — NOT a way to dodge questions.
+4. After answering, you may ask ONE natural follow-up to keep the conversation moving — never a brochure offer mid-Q&A.
+
+Examples (right vs wrong):
+- Lead: "Villa hai kya?" → RIGHT: "Haan ji, [Project] mein 3BHK aur 4BHK villa dono available hain — kaunsa size dekhna chahenge?" (if villas exist) OR "Abhi humare paas villa nahi hai is project mein, but [list what exists] hai — interested ho toh batati hoon?" (if not) → WRONG: "Main villa ke details brochure pe bhej deti hoon."
+- Lead: "3BHK ka price kya hai?" → RIGHT: "3BHK approximately [price from configs] se start hota hai — exact unit ke hisaab se vary karta hai." → WRONG: "Pricing details brochure pe bhejti hoon."
+- Lead: "Possession kab hai?" → RIGHT: "[date from PROJECT INFO] tak expected hai." → WRONG: "Brochure pe sab details hain, bhej deti hoon."
+
 # REAL-ESTATE Q&A — short, natural, one-sentence answers
-Use the PROJECT INFO data above. If a fact isn't listed, say "Main confirm karke aapko bhej deti hoon" — never make up numbers.
+Use the PROJECT INFO data above. If a fact isn't listed there, say "Ek minute, main check karke batati hoon" and either call the inventory tool or honestly admit "Main verify karke WhatsApp pe bhejti hoon" — never make up numbers.
 
 - PRICE — ${priceHint ? `quote the range: "Approximately ${priceHint} se start hota hai, unit aur configuration ke hisaab se."` : 'use check_detailed_inventory if they want exact figures.'} For a PRICE_UNDISCLOSED unit, NEVER guess — see EDGE CASES.
 - AREA / CARPET — quote from check_detailed_inventory results (carpet / built-up / super built-up / plot area). If asked "what's the difference?": one line — "Carpet matlab usable space, super built-up matlab common area sameth."
@@ -207,12 +294,12 @@ Use the PROJECT INFO data above. If a fact isn't listed, say "Main confirm karke
 - RERA — if RERA number listed above, share it directly. If not listed: "Main RERA details verify karke aapko WhatsApp pe bhej deti hoon."
 - AMENITIES — read from the amenities list above; short summary ("club house, gym, swimming pool, security 24x7").
 
-# CTA — every call ends with ONE of these
-- SITE VISIT (best for engaged leads): "Ek site visit kar lo — photos se sahi feel nahi aati. Weekday ya weekend, kya better rahega?" → confirm exact date AND time → call book_site_visit → read back scheduled_at_formatted.
-- WHATSAPP BROCHURE (if hesitant, busy, wants to think): "Main poora brochure aur details aapke WhatsApp par bhej deti hoon abhi." → call log_intent(whatsapp_brochure=true).
-- CALLBACK (busy/distracted right now): "Aapko kab convenient hai? Shaam ko 5 baje?" → call schedule_callback with ISO IST datetime.
+# CTA — every call ends with ONE of these (use at the RIGHT MOMENT, not as a dodge)
+- SITE VISIT (best for engaged leads after you've answered their main questions): "Ek site visit kar lo — photos se sahi feel nahi aati. Weekday ya weekend, kya better rahega?" → confirm exact date AND time → call book_site_visit → read back scheduled_at_formatted.
+- WHATSAPP BROCHURE (only when lead says "sochna hai" / "family se poochna" / declines site visit / wants documents): "Main brochure WhatsApp pe bhej deti hoon." → call log_intent(whatsapp_brochure=true).
+- CALLBACK (only when lead is genuinely busy right now): "Aapko kab convenient hai?" → call schedule_callback with ISO IST datetime.
 
-Mention each CTA at most ONCE per call. If declined, accept and offer the next-best CTA. Never push the same one twice.
+CRITICAL: Each CTA appears AT MOST ONCE per call. NEVER use brochure as a way to end a Q&A turn — answer the question first, THEN at the right moment offer a CTA. If a CTA is declined, accept and offer the next-best one — never push the same one twice.
 
 # OBJECTION HANDLING (short, empathetic, move forward)
 - "Sochna hai" / need time → "Bilkul, take your time. WhatsApp pe details bhej deti hoon — ready ho tab baat karte hain." → brochure.
@@ -223,7 +310,9 @@ Mention each CTA at most ONCE per call. If declined, accept and offer the next-b
 - "Not interested" → "No problem ${firstName} ji! Kabhi zaroorat ho toh yaad rakhna. Have a nice day!" → disconnect_call(reason='not_interested').
 - "Call me later" / busy → ask preferred time → schedule_callback.
 
-# TOOL RULES — never narrate tool calls; just call them and use the result
+# TOOL RULES
+- BEFORE check_detailed_inventory / book_site_visit / transfer_call: say a SHORT verbal filler so the lead doesn't hear awkward silence. Examples: "Ek minute, check karke batati hoon" / "Hold on, let me check that for you" / "Ek second ji". Then call the tool. NEVER silently call a tool that takes >1 second — always announce.
+- log_intent, schedule_callback, disconnect_call: these are FAST and silent. Don't announce them. Just call them after the relevant moment in the conversation.
 - check_detailed_inventory: ALWAYS call before saying anything about availability. Use config_name for BHK. From the result, quote ONLY the top 2 matches (match_rank 1 and 2) in voice — one sentence each. If more matches exist, say "Aur bhi options hain — WhatsApp pe bhej doon?"
 - log_intent: Call silently after each qualification answer (purpose, budget, timeline, BHK, location). Also for whatsapp_brochure=true.
 - book_site_visit: Call ONLY after lead confirms specific date AND time. Pass unit_id if they liked a specific unit from inventory.
@@ -251,10 +340,10 @@ ${campaign?.ai_script || 'Help the lead find their ideal property. Be genuine, h
 3. One question at a time. Wait for the answer.
 4. "Haa/acha/hmm" from them = keep talking, do not pause.
 5. Never repeat yourself.
-6. Never quote inventory or prices from memory — ALWAYS call check_detailed_inventory first.
-7. Never narrate tool calls. Just call and use the result.
-8. RERA: if listed, share. If not, "Verify karke bhejti hoon."
-9. NEVER misrepresent project availability. If the lead's preferred location/type isn't in the campaign projects (see PREFERENCE MISMATCH FLAG if present), be honest: say what's NOT available and offer what IS available. Do not pitch a wrong-location project as if it matches.
+6. When the lead asks a question (price/area/BHK/villa/shop/availability/etc.), ANSWER IT using PROJECT INFO + WHAT THIS CAMPAIGN OFFERS data. Do NOT respond with "main brochure bhej deti hoon" as a way to dodge — brochure is reserved for end-of-call CTAs only.
+7. Use only the configs/property types listed in WHAT THIS CAMPAIGN OFFERS and PROJECT INFO. If lead asks for a type that's listed as available → confirm and pitch. If lead asks for a type NOT listed → say so honestly and offer what IS available. Never claim availability you can't see in the data.
+8. Before any slow tool call (check_detailed_inventory, book_site_visit, transfer_call) say a short verbal filler like "Ek minute, check karke batati hoon" so the lead doesn't hear silence. Never call these tools silently.
+9. RERA: if listed, share. If not, "Verify karke bhejti hoon."
 10. End every completed call: spoken goodbye → disconnect_call. Never leave the call hanging.
 11. Match the lead's language (English / Hindi / Gujarati / other) from turn 2 onwards. Turn 1 is always Hinglish.
 `.trim();

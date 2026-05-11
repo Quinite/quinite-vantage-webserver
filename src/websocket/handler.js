@@ -42,6 +42,31 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                 });
         });
 
+        // Fetch ACTUAL available units (not just config blueprints) for all campaign projects.
+        // Units = real inventory the AI can promise. The joined config gives us the
+        // property_type / category / config_name labels for each available unit.
+        const campaignUnitsPromise = contextPromise.then(([, { data: camp }]) => {
+            const projectIds = (camp?.campaign_projects || [])
+                .map(cp => cp.project_id)
+                .filter(Boolean);
+            const fallbackProjectId = !projectIds.length && camp?.project_id ? [camp.project_id] : [];
+            const ids = projectIds.length ? projectIds : fallbackProjectId;
+            if (!ids.length) return [];
+            const cacheKey = `units_${ids.sort().join('_')}`;
+            const cached = getCachedContext(cacheKey);
+            if (cached) return cached;
+            return supabase.from('units')
+                .select('project_id, total_price, base_price, price_undisclosed, bedrooms, facing, floor_number, config:unit_configs(category, property_type, config_name)')
+                .in('project_id', ids)
+                .eq('status', 'available')
+                .eq('is_archived', false)
+                .then(({ data }) => {
+                    const units = data || [];
+                    setCachedContext(cacheKey, units);
+                    return units;
+                });
+        });
+
         let conversationTranscript = '';
         let callLogId = null;
         // Record when Plivo WS connects — this is when the lead actually answered.
@@ -167,14 +192,16 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                     preferred_timeline: context.preferred_timeline,
                 };
 
-                // 3. Org projects were already fetching in parallel — just await the result.
-                const allOrgProjects = await orgProjectsPromise;
+                // 3. Org projects & campaign available units were fetching in parallel — await both.
+                const [allOrgProjects, campaignUnits] = await Promise.all([orgProjectsPromise, campaignUnitsPromise]);
 
                 // 4. Send session update and greeting IMMEDIATELY.
                 // We don't wait for session.updated or Plivo start — OpenAI processes these in order.
-                const sessionUpdate = createSessionUpdate(context, campaign, campaignProjects, allOrgProjects);
+                const t0 = Date.now();
+                const sessionUpdate = createSessionUpdate(context, campaign, campaignProjects, allOrgProjects, campaignUnits);
                 realtimeWS.send(JSON.stringify(sessionUpdate));
                 realtimeWS.send(JSON.stringify({ type: 'response.create' }));
+                logger.info('Greeting dispatched', { callSid, msFromConnect: t0 - callStartTime, promptBytes: sessionUpdate.session.instructions.length });
                 resetSilenceTimer();
 
                 // Resolve call log ID in background; tools that need it will find it set.
