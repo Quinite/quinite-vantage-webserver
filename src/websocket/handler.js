@@ -51,6 +51,9 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
         let keepalive = null;
         let responseActive = false; // tracks whether OpenAI has an active response in-flight
         let silenceTimeoutMs = 15000; // Default until campaign context loads
+        // Debounce cancel: only cancel AI if user speech is sustained (>300ms), not brief
+        // backchannel affirmations like "haa", "acha", "hmm" common in Indian conversations.
+        let cancelDebounce = null;
 
         // Accumulated OpenAI Realtime token usage across all response.done events this call
         const realtimeUsage = {
@@ -249,11 +252,28 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                         break;
 
                     case 'input_audio_buffer.speech_started':
-                        if (plivoWS.readyState === WebSocket.OPEN) {
-                            plivoWS.send(JSON.stringify({ event: 'clearAudio' }));
-                        }
-                        if (responseActive) {
-                            realtimeWS.send(JSON.stringify({ type: 'response.cancel' }));
+                        // Debounce: wait 320ms before cancelling the AI response.
+                        // Brief Indian backchannels ("haa", "acha", "hmm") are typically
+                        // under 300ms and should not interrupt the AI mid-sentence.
+                        // If speech_stopped fires before the debounce fires, we clear it.
+                        if (cancelDebounce) clearTimeout(cancelDebounce);
+                        cancelDebounce = setTimeout(() => {
+                            cancelDebounce = null;
+                            if (plivoWS.readyState === WebSocket.OPEN) {
+                                plivoWS.send(JSON.stringify({ event: 'clearAudio' }));
+                            }
+                            if (responseActive) {
+                                realtimeWS.send(JSON.stringify({ type: 'response.cancel' }));
+                            }
+                        }, 320);
+                        break;
+
+                    case 'input_audio_buffer.speech_stopped':
+                        // User stopped speaking before the debounce fired — it was a brief
+                        // backchannel, not a real interruption. Cancel the pending cancel.
+                        if (cancelDebounce) {
+                            clearTimeout(cancelDebounce);
+                            cancelDebounce = null;
                         }
                         break;
 
