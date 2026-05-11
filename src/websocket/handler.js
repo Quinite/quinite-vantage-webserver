@@ -24,9 +24,28 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
             supabase.from('campaigns').select('*, organization:organizations!inner(id, name, caller_id, subscription_status, call_credits(*)), campaign_projects(project_id, project:projects(id, name, description, address, city, locality, possession_date, rera_number, amenities))').eq('id', campaignId).single()
         ]);
 
+        // As soon as campaign resolves we know org ID — fire projects fetch immediately
+        // so it runs in parallel with the open handler's validation logic.
+        const orgProjectsPromise = contextPromise.then(([, { data: camp }]) => {
+            if (!camp?.organization?.id) return [];
+            const cacheKey = `projects_${camp.organization.id}`;
+            const cached = getCachedContext(cacheKey);
+            if (cached) return cached;
+            return supabase.from('projects')
+                .select('id, name, description, locality, city, address')
+                .eq('organization_id', camp.organization.id)
+                .eq('status', 'active')
+                .then(({ data }) => {
+                    const projects = data || [];
+                    setCachedContext(cacheKey, projects);
+                    return projects;
+                });
+        });
+
         let conversationTranscript = '';
         let callLogId = null;
-        let callStartTime = null;
+        // Record when Plivo WS connects — this is when the lead actually answered.
+        const callStartTime = Date.now();
         let silenceTimer = null;
         let cleanupCalled = false;
         let keepalive = null;
@@ -129,21 +148,13 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                 }
                 const campaignProjectIds = campaignProjects.map(p => p.id);
 
-                // 3. Fetch organization projects (for "other projects" info) in parallel with session setup
-                const cacheKey = `projects_${organization.id}`;
-                let allOrgProjects = getCachedContext(cacheKey);
-                if (!allOrgProjects) {
-                    const { data } = await supabase.from('projects').select('id, name, description, locality, city, address').eq('organization_id', organization.id).eq('status', 'active');
-                    allOrgProjects = data || [];
-                    setCachedContext(cacheKey, allOrgProjects);
-                }
+                // 3. Org projects were already fetching in parallel — just await the result.
+                const allOrgProjects = await orgProjectsPromise;
 
                 // 4. Send session update and greeting IMMEDIATELY.
                 // We don't wait for session.updated or Plivo start — OpenAI processes these in order.
                 const sessionUpdate = createSessionUpdate(context, campaign, campaignProjects, allOrgProjects);
                 realtimeWS.send(JSON.stringify(sessionUpdate));
-                
-                callStartTime = Date.now();
                 realtimeWS.send(JSON.stringify({ type: 'response.create' }));
                 resetSilenceTimer();
 
