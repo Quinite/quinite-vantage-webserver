@@ -11,59 +11,18 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, callSid) {
     try {
-        logger.info('Fetching call context', { callSid, leadId, campaignId });
-
-        // Fetch lead and campaign BEFORE creating the OpenAI WS.
-        // If we created the WS first and then awaited DB queries, the 'open' event
-        // could fire while we're still awaiting — before the handler is registered — and be lost.
-        const [{ data: context, error: contextError }, { data: campaignData, error: campaignError }] = await Promise.all([
-            supabase.from('leads').select('*, project:projects(*)').eq('id', leadId).single(),
-            supabase.from('campaigns').select('*, organization:organizations!inner(id, name, caller_id, subscription_status, call_credits(*)), campaign_projects(project_id, project:projects(id, name, description, address, city, locality, possession_date, rera_number, amenities))').eq('id', campaignId).single()
-        ]);
-
-        if (contextError || campaignError || !context || !campaignData) {
-            logger.error('Context fetch failed', { callSid, leadError: contextError?.message, campaignError: campaignError?.message });
-            try { await plivoClient.calls.hangup(callSid); } catch (_) {}
-            plivoWS.close();
-            return null;
-        }
-
-        const campaign = campaignData;
-        const organization = campaign.organization;
-        const credits = organization?.call_credits;
-        const balance = Array.isArray(credits) ? parseFloat(credits[0]?.balance || 0) : parseFloat(credits?.balance || 0);
-
-        // Derive campaign projects (junction table rows); backward-compat fallback to lead's project
-        let campaignProjects = campaign.campaign_projects?.map(cp => cp.project).filter(Boolean) || [];
-        if (campaignProjects.length === 0 && campaign.project_id) {
-            campaignProjects = [context.project].filter(Boolean);
-        }
-        const campaignProjectIds = campaignProjects.map(p => p.id);
-
-        if (!['active', 'running'].includes(campaign.status)) {
-            logger.warn('Campaign or project inactive — rejecting call', { callSid, status: campaign.status });
-            try { await plivoClient.calls.hangup(callSid); } catch (_) {}
-            plivoWS.close();
-            return null;
-        }
-
-        if (!['active', 'trialing'].includes(organization.subscription_status) || balance < 0.5) {
-            logger.warn('Credits exhausted or subscription inactive — rejecting call', { callSid, balance, subStatus: organization.subscription_status });
-            try { await plivoClient.calls.hangup(callSid); } catch (_) {}
-            plivoWS.close();
-            return null;
-        }
-
-        logger.info('Context ready — opening OpenAI WS', { callSid, leadName: context.name, campaignId });
-
-        // All validation passed. Now create the OpenAI WS. All handlers are registered
-        // synchronously before yielding, so no event can fire before we're ready.
+        // 1. Start OpenAI WS and DB context fetches in parallel IMMEDIATELY
         const realtimeWS = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview', {
             headers: {
                 'Authorization': `Bearer ${OPENAI_API_KEY}`,
                 'OpenAI-Beta': 'realtime=v1'
             }
         });
+
+        const contextPromise = Promise.all([
+            supabase.from('leads').select('*, project:projects(*)').eq('id', leadId).single(),
+            supabase.from('campaigns').select('*, organization:organizations!inner(id, name, caller_id, subscription_status, call_credits(*)), campaign_projects(project_id, project:projects(id, name, description, address, city, locality, possession_date, rera_number, amenities))').eq('id', campaignId).single()
+        ]);
 
         let conversationTranscript = '';
         let callLogId = null;
@@ -72,6 +31,7 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
         let cleanupCalled = false;
         let keepalive = null;
         let responseActive = false; // tracks whether OpenAI has an active response in-flight
+        let silenceTimeoutMs = 15000; // Default until campaign context loads
 
         // Accumulated OpenAI Realtime token usage across all response.done events this call
         const realtimeUsage = {
@@ -79,8 +39,6 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
             output_text_tokens: 0, output_audio_tokens: 0,
             total_tokens: 0,
         };
-
-        const silenceTimeoutMs = (campaign.call_settings?.silence_timeout || 15) * 1000;
 
         // If OpenAI WS doesn't open within 12s, hang up
         const startupTimeout = setTimeout(async () => {
@@ -109,11 +67,15 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
             if (keepalive) clearInterval(keepalive);
             if (realtimeWS.readyState === WebSocket.OPEN) realtimeWS.close();
 
-            await finalizeCallOutcome(
-                callLogId, leadId, campaignId, conversationTranscript,
-                callSid, callStartTime || Date.now(), organization.id, campaign.name,
-                realtimeUsage
-            );
+            // We need the context for cleanup too, so wait if it hasn't finished yet
+            const [{ data: context }, { data: campaign }] = await contextPromise;
+            if (context && campaign) {
+                await finalizeCallOutcome(
+                    callLogId, leadId, campaignId, conversationTranscript,
+                    callSid, callStartTime || Date.now(), campaign.organization_id, campaign.name,
+                    realtimeUsage
+                );
+            }
         };
 
         // Wire cleanup to both sides before anything can close them
@@ -134,29 +96,66 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                 clearTimeout(startupTimeout);
                 logger.info('OpenAI WS ready', { callSid });
 
-                // Send session config immediately — no need to wait for Plivo 'start'.
-                // Plivo 'start' is only needed before audio can flow, not for session setup.
-                await sendSessionUpdate(realtimeWS, context, campaign, campaignProjects, callSid);
+                // 2. Wait for context fetch to finish
+                const [{ data: context, error: contextError }, { data: campaignData, error: campaignError }] = await contextPromise;
+                
+                if (contextError || campaignError || !context || !campaignData) {
+                    logger.error('Context fetch failed', { callSid, leadError: contextError?.message, campaignError: campaignError?.message });
+                    realtimeWS.close();
+                    try { await plivoClient.calls.hangup(callSid); } catch (_) {}
+                    plivoWS.close();
+                    return;
+                }
 
-                // Wait for both: Plivo stream ready AND OpenAI session.updated confirmation.
-                // This eliminates the initial silence — response.create is only sent once
-                // OpenAI has fully applied the session config and audio is flowing from Plivo.
-                await Promise.all([plivoWS.startPromise, sessionReadyPromise]);
+                const campaign = campaignData;
+                silenceTimeoutMs = (campaign.call_settings?.silence_timeout || 15) * 1000;
+                
+                const organization = campaign.organization;
+                const credits = organization?.call_credits;
+                const balance = Array.isArray(credits) ? parseFloat(credits[0]?.balance || 0) : parseFloat(credits?.balance || 0);
+
+                if (!['active', 'running'].includes(campaign.status) || !['active', 'trialing'].includes(organization.subscription_status) || balance < 0.5) {
+                    logger.warn('Call rejected (status or credits)', { callSid, campaignStatus: campaign.status, balance });
+                    realtimeWS.close();
+                    try { await plivoClient.calls.hangup(callSid); } catch (_) {}
+                    plivoWS.close();
+                    return;
+                }
+
+                // Derive campaign projects (junction table rows); backward-compat fallback to lead's project
+                let campaignProjects = campaign.campaign_projects?.map(cp => cp.project).filter(Boolean) || [];
+                if (campaignProjects.length === 0 && campaign.project_id) {
+                    campaignProjects = [context.project].filter(Boolean);
+                }
+                const campaignProjectIds = campaignProjects.map(p => p.id);
+
+                // 3. Fetch organization projects (for "other projects" info) in parallel with session setup
+                const cacheKey = `projects_${organization.id}`;
+                let allOrgProjects = getCachedContext(cacheKey);
+                if (!allOrgProjects) {
+                    const { data } = await supabase.from('projects').select('id, name, description, locality, city, address').eq('organization_id', organization.id).eq('status', 'active');
+                    allOrgProjects = data || [];
+                    setCachedContext(cacheKey, allOrgProjects);
+                }
+
+                // 4. Send session update and greeting IMMEDIATELY.
+                // We don't wait for session.updated or Plivo start — OpenAI processes these in order.
+                const sessionUpdate = createSessionUpdate(context, campaign, campaignProjects, allOrgProjects);
+                realtimeWS.send(JSON.stringify(sessionUpdate));
+                
                 callStartTime = Date.now();
-
                 realtimeWS.send(JSON.stringify({ type: 'response.create' }));
                 resetSilenceTimer();
 
                 // Resolve call log ID in background; tools that need it will find it set.
-                logCallStart(context, campaign, callSid).then(id => {
+                logCallStart(context, campaign, callSid).then(async id => {
                     callLogId = id;
                     // Record the actual conversation start time so the live calls page
                     // can show accurate duration (call_logs.created_at is pre-connection).
                     if (id) {
-                        supabase.from('call_logs')
+                        await supabase.from('call_logs')
                             .update({ metadata: { started_at: new Date(callStartTime).toISOString() } })
-                            .eq('id', id)
-                            .catch(() => {});
+                            .eq('id', id);
                     }
                 }).catch(err => {
                     logger.error('logCallStart failed', { callSid, error: err.message });
@@ -283,32 +282,3 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
     }
 }
 
-async function sendSessionUpdate(realtimeWS, lead, campaign, campaignProjects, callSid) {
-    // Fetch all org projects for the "other projects" section (cached 30min)
-    const cacheKey = `projects_${campaign.organization_id}`;
-    let allOrgProjects = getCachedContext(cacheKey);
-
-    if (!allOrgProjects) {
-        const { data } = await supabase.from('projects')
-            .select('id, name, description, locality, city, address')
-            .eq('organization_id', campaign.organization_id)
-            .eq('status', 'active');
-        allOrgProjects = data || [];
-        setCachedContext(cacheKey, allOrgProjects);
-    }
-
-    logger.info('Session context', {
-        callSid,
-        leadName: lead.name,
-        leadProject: lead.project?.name || 'none',
-        campaignProjects: campaignProjects.map(p => p.name),
-        language: campaign.call_settings?.language,
-        voice: campaign.call_settings?.voice_id
-    });
-
-    const sessionUpdate = createSessionUpdate(lead, campaign, campaignProjects, allOrgProjects);
-    if (realtimeWS.readyState === WebSocket.OPEN) {
-        realtimeWS.send(JSON.stringify(sessionUpdate));
-        logger.info('session.update sent', { callSid, voice: campaign.call_settings?.voice_id, lang: campaign.call_settings?.language, campaignProjectCount: campaignProjects.length });
-    }
-}

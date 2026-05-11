@@ -132,7 +132,7 @@ export async function finalizeCallOutcome(callLogId, leadId, campaignId, transcr
                 if (count === 1) {
                     firePipelineTrigger(TRIGGER_KEYS.CALL_ANSWERED, leadId, organizationId).catch(() => {});
                     // Clear call_failed_at badge if set from a previous failed campaign
-                    supabase.from('leads').update({ call_failed_at: null }).eq('id', leadId).catch(() => {});
+                    await supabase.from('leads').update({ call_failed_at: null }).eq('id', leadId);
                 }
             } else if (finalCampaignLeadStatus === 'failed' && organizationId) {
                 // Only fire call_exhausted if no more queued/active attempts remain for this lead
@@ -144,10 +144,9 @@ export async function finalizeCallOutcome(callLogId, leadId, campaignId, transcr
                     .in('status', ['queued', 'calling', 'processing']);
                 if (pendingCount === 0) {
                     firePipelineTrigger(TRIGGER_KEYS.CALL_EXHAUSTED, leadId, organizationId).catch(() => {});
-                    supabase.from('leads')
+                    await supabase.from('leads')
                         .update({ call_failed_at: endedAt })
-                        .eq('id', leadId)
-                        .catch(() => {});
+                        .eq('id', leadId);
                 }
             }
         }

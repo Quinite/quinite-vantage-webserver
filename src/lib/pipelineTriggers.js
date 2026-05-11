@@ -6,6 +6,7 @@ export const TRIGGER_KEYS = {
     CALL_TRANSFERRED:        'call_transferred',
     CALL_CALLBACK_REQUESTED: 'call_callback_requested',
     CALL_EXHAUSTED:          'call_exhausted',
+    SITE_VISIT_BOOKED:       'site_visit_booked',
 };
 
 export async function firePipelineTrigger(triggerKey, leadId, organizationId) {
