@@ -75,7 +75,7 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
         let cleanupCalled = false;
         let keepalive = null;
         let responseActive = false; // tracks whether OpenAI has an active response in-flight
-        let silenceTimeoutMs = 15000; // Default until campaign context loads
+        let silenceTimeoutMs = 25000; // Default until campaign context loads
         // Debounce cancel: only cancel AI if user speech is sustained (>300ms), not brief
         // backchannel affirmations like "haa", "acha", "hmm" common in Indian conversations.
         let cancelDebounce = null;
@@ -161,7 +161,7 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                 }
 
                 const campaign = campaignData;
-                silenceTimeoutMs = (campaign.call_settings?.silence_timeout || 15) * 1000;
+                silenceTimeoutMs = (campaign.call_settings?.silence_timeout || 25) * 1000;
 
                 organization = campaign.organization;
                 const credits = organization?.call_credits;
@@ -195,11 +195,14 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                 // 3. Org projects & campaign available units were fetching in parallel — await both.
                 const [allOrgProjects, campaignUnits] = await Promise.all([orgProjectsPromise, campaignUnitsPromise]);
 
-                // 4. Send session update and greeting IMMEDIATELY.
-                // We don't wait for session.updated or Plivo start — OpenAI processes these in order.
-                const t0 = Date.now();
+                // 4. Send session update first, then wait for Plivo stream to be ready
+                // before triggering the greeting — otherwise the opening audio chunks are
+                // emitted before Plivo can play them and the lead hears nothing until they speak.
                 const sessionUpdate = createSessionUpdate(context, campaign, campaignProjects, allOrgProjects, campaignUnits);
                 realtimeWS.send(JSON.stringify(sessionUpdate));
+
+                await plivoWS.startPromise;
+                const t0 = Date.now();
                 realtimeWS.send(JSON.stringify({ type: 'response.create' }));
                 logger.info('Greeting dispatched', { callSid, msFromConnect: t0 - callStartTime, promptBytes: sessionUpdate.session.instructions.length });
                 resetSilenceTimer();
@@ -236,8 +239,11 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
         realtimeWS.on('message', async (message) => {
             try {
                 const response = JSON.parse(message);
-                resetSilenceTimer();
 
+                // Only user-side activity should reset the silence timer. Resetting on every
+                // OpenAI event (including the AI's own audio deltas) means the timer effectively
+                // never measures actual lead silence. We reset on user speech start/stop and
+                // on completed user transcriptions below.
                 switch (response.type) {
                     case 'session.updated':
                         resolveSessionReady();
@@ -284,6 +290,8 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
 
                     case 'response.done':
                         responseActive = false;
+                        // Start measuring lead silence from the moment the AI finishes speaking.
+                        resetSilenceTimer();
                         if (response.response?.usage) {
                             const u = response.response.usage;
                             realtimeUsage.input_text_tokens  += u.input_token_details?.text_tokens  || 0;
@@ -299,6 +307,7 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                         break;
 
                     case 'input_audio_buffer.speech_started':
+                        resetSilenceTimer();
                         // Debounce: wait 320ms before cancelling the AI response.
                         // Brief Indian backchannels ("haa", "acha", "hmm") are typically
                         // under 300ms and should not interrupt the AI mid-sentence.
@@ -316,6 +325,7 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                         break;
 
                     case 'input_audio_buffer.speech_stopped':
+                        resetSilenceTimer();
                         // User stopped speaking before the debounce fired — it was a brief
                         // backchannel, not a real interruption. Cancel the pending cancel.
                         if (cancelDebounce) {

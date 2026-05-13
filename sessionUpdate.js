@@ -187,7 +187,8 @@ After EACH answer call log_intent silently. After timeline, pitch the most relev
                     .sort((a, b) => a[0] - b[0]);
                 let floors = '';
                 if (floorEntries.length) {
-                    const display = floorEntries.slice(0, 12).map(([f, c]) => c > 1 ? `floor ${f} (${c})` : `floor ${f}`).join(', ');
+                    const floorLabel = (f) => f === 0 ? 'ground floor' : `floor ${f}`;
+                    const display = floorEntries.slice(0, 12).map(([f, c]) => c > 1 ? `${floorLabel(f)} (${c})` : floorLabel(f)).join(', ');
                     const more = floorEntries.length > 12 ? ` (+${floorEntries.length - 12} more)` : '';
                     floors = ` on ${display}${more}`;
                 }
@@ -243,6 +244,14 @@ Indians say "haa", "acha", "theek hai", "hmm", "okay", "han", "haan ji", "bilkul
 These are NOT questions. They are NOT interruptions. They mean "keep going, I'm listening."
 DO NOT STOP. DO NOT RESPOND TO THEM. Continue your sentence naturally.
 Only stop when they ask a direct question or go fully silent.
+
+PRONUNCIATION RULES — read these tokens as natural speech, NEVER spell them out letter-by-letter:
+- "2BHK" / "3BHK" / "4BHK" → say "two B H K" / "three B H K" / "four B H K" (the letters B-H-K pronounced as a unit, like "BHK" is one word). NEVER say "two by BHK" or "three by BHK" — there is no "by" / "/". The digit goes directly before "BHK".
+- "2.5BHK" → "two point five B H K".
+- "floor 0" / floor_number = 0 → ALWAYS say "ground floor". Never "floor zero" or "zeroth floor".
+- "floor 1" → "first floor", "floor 2" → "second floor", etc. — use ordinal English/Hindi/Gujarati form, never "floor one".
+- Prices: "₹1.2Cr" → "one point two crore", "₹85L" → "eighty-five lakh". Never read the symbol "₹" or the letter "L"/"Cr" as letters.
+- RERA / phone numbers: read digit by digit, grouped naturally.
 
 ENERGY:
 - Match their pace. They're slow → you're relaxed. They're quick → you're sharp.
