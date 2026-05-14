@@ -94,7 +94,7 @@ Plivo Phone ◄──────►   Express Server (index.js)  │
 
 ### 5. AI Agent Tools (`src/tools/`)
 
-The AI agent can call 5 tools mid-conversation:
+The AI agent can call 5 tools mid-conversation :
 
 | Tool | File | What it does |
 |---|---|---|
