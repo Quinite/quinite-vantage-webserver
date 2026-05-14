@@ -5,10 +5,9 @@
     "main": "index.js",
     "type": "module",
     "scripts": {
-        "start": "concurrently \"node index.js\" \"node queueWorker.js\" \"node retryWorker.js\"",
+        "start": "concurrently \"node index.js\" \"node queueWorker.js\"",
         "server": "node index.js",
         "worker": "node queueWorker.js",
-        "retry": "node retryWorker.js",
         "dev": "node index.js"
     },
     "dependencies": {

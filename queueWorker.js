@@ -1,147 +1,359 @@
-import { createClient } from '@supabase/supabase-js';
-import plivo from 'plivo';
+import { supabase } from './services/supabase.js';
+import { plivoClient } from './services/plivo.js';
+import { logger } from './src/lib/logger.js';
+import { hasAvailableCredits } from './src/lib/callLifecycle.js';
 import dotenv from 'dotenv';
-import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
 
-// Load environment variables
-const __dirname = dirname(fileURLToPath(import.meta.url));
 dotenv.config();
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
-const PLIVO_AUTH_ID = process.env.PLIVO_AUTH_ID;
-const PLIVO_AUTH_TOKEN = process.env.PLIVO_AUTH_TOKEN;
-const PLIVO_PHONE_NUMBER = process.env.PLIVO_PHONE_NUMBER;
-const WEBSOCKET_SERVER_URL = process.env.WEBSOCKET_SERVER_URL || 'https://vantage-websocket-server.up.railway.app'; // Adjust default
-const NEXT_PUBLIC_SITE_URL = process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000';
+const POLL_INTERVAL_MS = 4000;
+const MAX_CONCURRENT_CALLS = 10;
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !PLIVO_AUTH_ID || !PLIVO_AUTH_TOKEN) {
-    console.error("❌ Missing Configuration for Queue Worker");
-    process.exit(1);
+// Track per-campaign credit failure start time (campaignId -> Date)
+const creditFailureSince = new Map();
+
+logger.info('Queue worker starting');
+
+async function markCampaignFailed(campaignId, failReason) {
+    const { data: camp } = await supabase.from('campaigns').select('metadata').eq('id', campaignId).single();
+    const existingMeta = camp?.metadata || {};
+    const { error } = await supabase.from('campaigns').update({
+        status: 'failed',
+        metadata: { ...existingMeta, fail_reason: failReason, failed_at: new Date().toISOString() },
+        updated_at: new Date().toISOString()
+    }).eq('id', campaignId).in('status', ['running', 'paused']);
+    if (!error) {
+        logger.warn('Campaign marked failed', { campaignId, failReason });
+    } else {
+        logger.error('Failed to mark campaign failed', { campaignId, failReason, error: error.message });
+    }
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
-const plivoClient = new plivo.Client(PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN);
+async function checkAllLeadsUnreachable(campaignId) {
+    const TERMINAL_STATUSES = ['called', 'failed', 'skipped', 'opted_out', 'archived'];
 
-// RATE LIMIT SETTINGS
-const MAX_CONCURRENT_CALLS_PER_BATCH = 10; // Plivo might limit concurrent channels
-const POLL_INTERVAL_MS = 5000;
-const CALLS_PER_SECOND = 2; // Conservative rate limit
+    const { data: leads, error } = await supabase
+        .from('campaign_leads')
+        .select('status')
+        .eq('campaign_id', campaignId);
 
-console.log("🚀 Starting Queue Worker...");
-console.log(`   Poll Interval: ${POLL_INTERVAL_MS}ms`);
-console.log(`   Rate Limit: ${CALLS_PER_SECOND} calls/sec`);
+    if (error || !leads?.length) return;
+
+    const allTerminal = leads.every(l => TERMINAL_STATUSES.includes(l.status));
+    if (!allTerminal) return;
+
+    const anySuccess = leads.some(l => l.status === 'called');
+    if (anySuccess) return; // auto-complete will handle it
+
+    await markCampaignFailed(campaignId, 'all_leads_unreachable');
+}
+
+async function checkRunningCampaigns() {
+    const { data: campaigns, error } = await supabase
+        .from('campaigns')
+        .select('id, organization_id, organization:organizations(subscription_status)')
+        .eq('status', 'running');
+
+    if (error || !campaigns?.length) return;
+
+    for (const campaign of campaigns) {
+        const subStatus = campaign.organization?.subscription_status;
+        const orgId = campaign.organization_id;
+
+        // 1. Subscription lapse
+        if (!['active', 'trialing'].includes(subStatus)) {
+            await markCampaignFailed(campaign.id, 'subscription_lapsed');
+            creditFailureSince.delete(campaign.id);
+            continue;
+        }
+
+        // 2. Credit exhaustion sustained for 30 minutes
+        const creditsAvailable = await hasAvailableCredits(orgId);
+        if (!creditsAvailable) {
+            if (!creditFailureSince.has(campaign.id)) {
+                creditFailureSince.set(campaign.id, Date.now());
+            } else if (Date.now() - creditFailureSince.get(campaign.id) >= 30 * 60 * 1000) {
+                await markCampaignFailed(campaign.id, 'credit_exhausted');
+                creditFailureSince.delete(campaign.id);
+                continue;
+            }
+        } else {
+            creditFailureSince.delete(campaign.id);
+        }
+
+        // 3. All leads unreachable with zero successful calls
+        await checkAllLeadsUnreachable(campaign.id);
+    }
+}
+
+async function enqueueNewlyEnrolledLeads() {
+    // Only enqueue leads for running (not paused) campaigns
+    const { data: campaigns, error } = await supabase
+        .from('campaigns')
+        .select('id, organization_id')
+        .eq('status', 'running');
+
+    if (error || !campaigns?.length) return;
+
+    for (const campaign of campaigns) {
+        const { data: leads, error: leadsError } = await supabase
+            .from('campaign_leads')
+            .select('lead_id')
+            .eq('campaign_id', campaign.id)
+            .eq('status', 'enrolled');
+
+        if (leadsError || !leads?.length) continue;
+
+        for (const { lead_id } of leads) {
+            // Check if already in queue
+            const { data: existing } = await supabase
+                .from('call_queue')
+                .select('id')
+                .eq('campaign_id', campaign.id)
+                .eq('lead_id', lead_id)
+                .in('status', ['queued', 'processing', 'failed'])
+                .maybeSingle();
+
+            if (existing) continue;
+
+            const { error: insertError } = await supabase.from('call_queue').insert({
+                campaign_id: campaign.id,
+                lead_id,
+                organization_id: campaign.organization_id,
+                status: 'queued',
+                attempt_count: 0,
+                next_retry_at: new Date().toISOString(),
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString()
+            });
+
+            if (insertError) {
+                logger.error('Failed to enqueue enrolled lead', { campaignId: campaign.id, lead_id, error: insertError.message });
+            } else {
+                await supabase.from('campaign_leads').update({ status: 'queued', updated_at: new Date().toISOString() })
+                    .match({ campaign_id: campaign.id, lead_id });
+                logger.info('Enrolled lead enqueued', { campaignId: campaign.id, lead_id });
+            }
+        }
+    }
+}
 
 async function processQueue() {
     try {
-        // 1. Fetch pending items suitable for retry
-        const { data: queueItems, error } = await supabase
+        await enqueueNewlyEnrolledLeads();
+        await checkRunningCampaigns();
+
+        const now = new Date().toISOString();
+
+        const { data: rawItems, error } = await supabase
             .from('call_queue')
-            .select('*')
-            .in('status', ['queued', 'failed']) // processing? No, generic fetch queued
-            .lte('next_retry_at', new Date().toISOString())
-            .lt('attempt_count', 3) // Max retries check
-            .limit(MAX_CONCURRENT_CALLS_PER_BATCH);
+            .select(`
+                *,
+                campaign:campaigns(
+                    id, status, organization_id, call_settings, time_start, time_end, dnd_compliance,
+                    organization:organizations(
+                        id,
+                        subscription_status,
+                        call_credits(*)
+                    )
+                )
+            `)
+            .in('status', ['queued', 'failed'])
+            .lte('next_retry_at', now)
+            .lt('attempt_count', 4)
+            .order('created_at', { ascending: true })
+            .limit(50);
 
-        if (error) throw error;
-
-        if (!queueItems || queueItems.length === 0) {
-            // console.log("💤 Queue empty...");
+        if (error) {
+            logger.error('Queue fetch error', { error: error.message });
             return;
         }
 
-        console.log(`📥 [Queue Worker] Processing ${queueItems.length} items from queue...`);
+        const queueItems = (rawItems || []).filter(item => {
+            const campStatus = item.campaign?.status;
+            const subStatus = item.campaign?.organization?.subscription_status;
+            return campStatus === 'running' && ['active', 'trialing'].includes(subStatus);
+        }).slice(0, MAX_CONCURRENT_CALLS);
 
-        for (const item of queueItems) {
-            console.log(`▶️ [Queue Worker] Processing Item ID: ${item.id} | Lead: ${item.lead_id}`);
-            await executeCall(item);
-            // Simple Rate Limiting: Sleep between calls
-            await new Promise(r => setTimeout(r, 1000 / CALLS_PER_SECOND));
-            console.log(`⏸️ [Queue Worker] Rate limit sleep done.`);
-        }
+        if (!queueItems.length) return;
+
+        logger.info('Queue processing', { eligible: queueItems.length, total: rawItems?.length });
+        await Promise.allSettled(queueItems.map(item => executeCall(item)));
 
     } catch (err) {
-        console.error("❌ Queue Process Error:", err.message);
+        logger.error('Queue loop error', { error: err.message });
     }
 }
 
 async function executeCall(item) {
-    const { id, lead_id, campaign_id, attempt_count } = item;
+    const { id, lead_id, campaign_id, attempt_count, organization_id, campaign } = item;
+
+    // Security: verify queue item belongs to the correct organization
+    if (organization_id && campaign?.organization_id && organization_id !== campaign.organization_id) {
+        logger.error('Org mismatch on queue item — possible tampering', { queueId: id, organization_id, campaignOrgId: campaign.organization_id });
+        await supabase.from('call_queue').update({ status: 'failed', last_error: 'org_mismatch_security' }).eq('id', id);
+        return;
+    }
+
+    // Check campaign time window (IST)
+    const nowIST = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false, hour: '2-digit', minute: '2-digit' });
+    if (campaign?.time_start && campaign?.time_end) {
+        if (nowIST < campaign.time_start || nowIST > campaign.time_end) {
+            const nextWindow = computeNextWindowOpen(campaign.time_start);
+            await supabase.from('call_queue').update({ status: 'queued', next_retry_at: nextWindow }).eq('id', id);
+            logger.info('Call outside time window — rescheduled', { queueId: id, nowIST, window: `${campaign.time_start}–${campaign.time_end}` });
+            return;
+        }
+    }
+
+    // DND compliance: 9am-9pm IST (TRAI rules)
+    if (campaign?.dnd_compliance !== false) {
+        if (nowIST < '09:00' || nowIST > '21:00') {
+            const nextWindow = computeNextWindowOpen(campaign?.time_start || '09:00');
+            await supabase.from('call_queue').update({ status: 'queued', next_retry_at: nextWindow }).eq('id', id);
+            logger.info('Call outside DND window — rescheduled', { queueId: id, nowIST });
+            return;
+        }
+    }
 
     try {
-        // A. Mark as Processing
-        await supabase.from('call_queue').update({ status: 'processing' }).eq('id', id);
-
-        // B. Fetch Lead Data (Phone)
-        const { data: lead } = await supabase.from('leads').select('phone, name').eq('id', lead_id).single();
-        if (!lead || !lead.phone) {
-            throw new Error("Invalid Lead or Missing Phone");
+        // Pre-call credit check: verify org has combined monthly + purchased credits > 0
+        const orgId = organization_id || campaign?.organization_id;
+        if (orgId) {
+            const creditsAvailable = await hasAvailableCredits(orgId);
+            if (!creditsAvailable) {
+                logger.warn('Pre-call credit check failed — skipping lead', { queueId: id, lead_id, campaign_id, orgId });
+                await Promise.all([
+                    supabase.from('call_queue').update({
+                        status: 'failed', attempt_count: 4, last_error: 'NO_CREDITS', updated_at: new Date()
+                    }).eq('id', id),
+                    campaign_id && supabase.from('campaign_leads').update({
+                        status: 'skipped', skip_reason: 'skipped_no_credits', updated_at: new Date()
+                    }).match({ campaign_id, lead_id })
+                ].filter(Boolean));
+                return;
+            }
         }
 
-        console.log(`📞 Dialing ${lead.name} (${lead.phone}) for Campaign ${campaign_id}...`);
+        // Atomic lock — prevents double-calling
+        const { data: lockedItem, error: lockError } = await supabase
+            .from('call_queue')
+            .update({ status: 'processing', updated_at: new Date() })
+            .match({ id, status: item.status })
+            .select()
+            .single();
 
-        // C. Make Call via Plivo
-        // Use websocket server's answer endpoint if available, else standard webhook
-        // We MUST point to the endpoint that generates the WebSocket XML.
-        // In this repo, that is usually specific.
-        const answerUrl = `${WEBSOCKET_SERVER_URL}/answer?leadId=${lead_id}&campaignId=${campaign_id}`;
+        if (lockError || !lockedItem) return;
 
-        const response = await plivoClient.calls.create(
-            PLIVO_PHONE_NUMBER,
-            lead.phone,
-            answerUrl,
-            {
-                answer_method: 'POST',
-                // Optional hooks
-                time_limit: 1800
-            }
-        );
+        const { data: leadContext } = await supabase
+            .from('leads')
+            .select('name, phone, archived_at, do_not_call, project:projects(archived_at)')
+            .eq('id', lead_id)
+            .single();
 
-        console.log(`   ✅ Call Initiated: SID=${response.requestUuid}`);
+        if (!leadContext?.phone) throw new Error('INVALID_LEAD_DATA');
+        if (leadContext.archived_at) throw new Error('LEAD_ARCHIVED');
+        if (leadContext.do_not_call) throw new Error('DO_NOT_CALL');
+        if (leadContext.project?.archived_at) throw new Error('PROJECT_ARCHIVED');
 
-        // D. Success - Update Queue & Lead
-        await supabase.from('call_queue').update({
-            status: 'completed',
-            updated_at: new Date()
-        }).eq('id', id);
+        const rawFrom = process.env.PLIVO_PHONE_NUMBER || '';
+        const fromNumber = rawFrom.startsWith('+') ? rawFrom.trim() : `+${rawFrom.replace(/\D/g, '')}`;
+        const rawTo = String(leadContext.phone).trim();
+        const formattedTo = rawTo.startsWith('+') ? rawTo : `+${rawTo.replace(/\D/g, '')}`;
 
-        // Update Lead's own status
-        await supabase.from('leads').update({
-            call_status: 'calling',
-            call_date: new Date().toISOString()
-        }).eq('id', lead_id);
+        if (!fromNumber.startsWith('+') || fromNumber.replace(/\D/g, '').length < 10) throw new Error(`INVALID_SENDER_ID: '${fromNumber}'`);
+        if (!formattedTo || formattedTo.replace(/\D/g, '').length < 10) throw new Error(`INVALID_DESTINATION: '${formattedTo}'`);
 
-        // Update Campaign Stats (Approximate)
-        // We do this individually to keep UI responsive. 
-        // Note: For high volume, an RPC or periodic aggregate would be better.
-        const { data: campaign } = await supabase.from('campaigns').select('total_calls').eq('id', campaign_id).single();
-        if (campaign) {
-            await supabase.from('campaigns').update({
-                total_calls: (campaign.total_calls || 0) + 1
-            }).eq('id', campaign_id);
+        const answerUrl = `${process.env.WEBSOCKET_SERVER_URL}/answer?leadId=${lead_id}&campaignId=${campaign_id}`;
+        const recordingCallbackUrl = `${process.env.WEBSOCKET_SERVER_URL}/recording`;
+        const hangupUrl = `${process.env.WEBSOCKET_SERVER_URL}/status?leadId=${lead_id}&campaignId=${campaign_id}`;
+        const response = await plivoClient.calls.create(fromNumber, formattedTo, answerUrl, {
+            answer_method: 'POST',
+            time_limit: 1800,
+            record: 'true',
+            record_callback_url: recordingCallbackUrl,
+            record_callback_method: 'POST',
+            hangup_url: hangupUrl,
+            hangup_method: 'POST',
+        });
+
+        const callSid = response.requestUuid || response.callUuid;
+        logger.info('Call dispatched', { callSid, leadId: lead_id, campaignId: campaign_id });
+
+        await supabase.from('call_queue').update({ status: 'completed', updated_at: new Date() }).eq('id', id);
+
+        // Mark campaign_leads as calling — call-end handler will update to called/failed
+        if (campaign_id) {
+            await supabase.from('campaign_leads').update({
+                status: 'calling',
+                last_call_attempt_at: new Date().toISOString(),
+                attempt_count: attempt_count + 1,
+                updated_at: new Date()
+            }).match({ campaign_id, lead_id });
         }
 
     } catch (err) {
-        console.error(`   ❌ Call Failed (Attempt ${attempt_count + 1}):`, err.message);
+        logger.error('Call execution failed', { queueId: id, error: err.message });
 
-        // E. Failure - Schedule Retry
-        const nextRetry = new Date();
-        nextRetry.setMinutes(nextRetry.getMinutes() + (5 * (attempt_count + 1))); // Linear backoff: 5m, 10m, 15m
+        const TERMINAL_ERRORS = ['LEAD_ARCHIVED', 'DO_NOT_CALL', 'PROJECT_ARCHIVED', 'INVALID_LEAD_DATA'];
+        if (TERMINAL_ERRORS.includes(err.message)) {
+            // No retry — skip permanently
+            await Promise.all([
+                supabase.from('call_queue').update({
+                    status: 'failed', attempt_count: 4, last_error: err.message, updated_at: new Date()
+                }).eq('id', id),
+                campaign_id && supabase.from('campaign_leads').update({
+                    status: 'skipped', skip_reason: err.message.toLowerCase(), updated_at: new Date()
+                }).match({ campaign_id, lead_id })
+            ].filter(Boolean));
+            logger.warn('Terminal error — lead skipped', { queueId: id, lead_id, reason: err.message });
+            return;
+        }
+
+        const isInsufficientFunds = err.message === 'INSUFFICIENT_FUNDS';
+        const retryDelayMs = isInsufficientFunds ? 5 * 60 * 1000 : (attempt_count + 1) * 30 * 60 * 1000;
 
         await supabase.from('call_queue').update({
-            status: 'failed', // Temporarily failed
-            attempt_count: attempt_count + 1,
+            status: isInsufficientFunds ? 'queued' : 'failed',
+            attempt_count: isInsufficientFunds ? attempt_count : attempt_count + 1,
             last_error: err.message,
-            next_retry_at: nextRetry.toISOString(),
+            next_retry_at: new Date(Date.now() + retryDelayMs).toISOString(),
             updated_at: new Date()
         }).eq('id', id);
     }
 }
 
-// Start Polling Loop
-setInterval(processQueue, POLL_INTERVAL_MS);
+function computeNextWindowOpen(timeStart) {
+    // Schedule for the time_start tomorrow (IST)
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const [hours, minutes] = timeStart.split(':').map(Number);
+    const nextOpen = new Date(tomorrow.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }));
+    nextOpen.setHours(hours - 5, minutes - 30, 0, 0); // Convert IST to UTC
+    return nextOpen.toISOString();
+}
 
-// Handle graceful shutdown
+async function cleanupStuckCalls() {
+    const timeout = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+    const { data } = await supabase.from('call_queue')
+        .update({ status: 'queued', updated_at: new Date() })
+        .eq('status', 'processing')
+        .lt('updated_at', timeout)
+        .select('id, campaign_id, lead_id');
+
+    if (data?.length) {
+        logger.warn('Stuck calls reset', { count: data.length });
+        // Also reset campaign_leads stuck in 'calling' state
+        const stuckThreshold = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+        await supabase.from('campaign_leads')
+            .update({ status: 'queued', updated_at: new Date() })
+            .eq('status', 'calling')
+            .lt('last_call_attempt_at', stuckThreshold);
+    }
+}
+
+setInterval(processQueue, POLL_INTERVAL_MS);
+setInterval(cleanupStuckCalls, 2 * 60 * 1000);
+
 process.on('SIGTERM', () => process.exit(0));
 process.on('SIGINT', () => process.exit(0));
