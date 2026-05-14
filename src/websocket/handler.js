@@ -19,6 +19,13 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
             }
         });
 
+        // Fast greeting query — only the columns the opening line needs.
+        // Resolves in ~100-200ms so we can start the AI talking ASAP after WS open.
+        const greetingPromise = Promise.all([
+            supabase.from('leads').select('name').eq('id', leadId).single(),
+            supabase.from('campaigns').select('call_settings, organization:organizations!inner(name), campaign_projects(project:projects(name, locality))').eq('id', campaignId).single()
+        ]);
+
         const contextPromise = Promise.all([
             supabase.from('leads').select('*, project:projects(*)').eq('id', leadId).single(),
             supabase.from('campaigns').select('*, organization:organizations!inner(id, name, caller_id, subscription_status, call_credits(*)), campaign_projects(project_id, project:projects(id, name, description, address, city, locality, possession_date, rera_number, amenities))').eq('id', campaignId).single()
@@ -149,11 +156,71 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                 clearTimeout(startupTimeout);
                 logger.info('OpenAI WS ready', { callSid });
 
-                // 2. Wait for context fetch to finish
+                // 2a. Wait for the FAST greeting query (lead name + campaign org/projects).
+                // This typically resolves in ~100-200ms so the AI can start speaking quickly
+                // instead of waiting for the heavy contextPromise (~500-1500ms).
+                const [{ data: leadLite, error: leadLiteErr }, { data: campLite, error: campLiteErr }] = await greetingPromise;
+
+                if (leadLiteErr || campLiteErr || !leadLite || !campLite) {
+                    logger.error('Greeting context fetch failed', { callSid, leadErr: leadLiteErr?.message, campErr: campLiteErr?.message });
+                    realtimeWS.close();
+                    try { await plivoClient.calls.hangup(callSid); } catch (_) {}
+                    plivoWS.close();
+                    return;
+                }
+
+                const firstName = leadLite.name?.split(' ')[0] || '';
+                const orgNameFast = campLite.organization?.name || 'hamari company';
+                const firstProject = campLite.campaign_projects?.[0]?.project;
+                const projectNameFast = firstProject?.name || '';
+                const projectLocFast = firstProject?.locality || '';
+                silenceTimeoutMs = (campLite.call_settings?.silence_timeout || 25) * 1000;
+
+                // Minimal greet-only prompt. Same VAD/audio config as the full session.update —
+                // the follow-up update will replace `instructions` with the rich prompt before
+                // turn 2 needs it. The greeting (turn 1) is constrained to ONE line so an
+                // abbreviated prompt is sufficient and safe.
+                const greetingInstructions = `You are Riya, a female sales consultant at ${orgNameFast}. The call has JUST connected. Your VERY FIRST utterance must be exactly one short Hinglish greeting line — introduce yourself + company + reason for call. Use feminine grammar ("bol rahi hoon"). Then STOP and wait for the lead. Do NOT ask qualifying questions yet. Do NOT explain anything. ONE sentence only.\n\nSay exactly: "Hi ${firstName} ji, main Riya bol rahi hoon ${orgNameFast} se — ${projectNameFast ? `${projectNameFast} project${projectLocFast ? ` ${projectLocFast} mein` : ''} ke regarding` : 'ek premium property project ke regarding'} call kar rahi thi."`;
+
+                const fastSessionUpdate = {
+                    type: 'session.update',
+                    session: {
+                        turn_detection: { type: 'server_vad', threshold: 0.55, prefix_padding_ms: 150, silence_duration_ms: 500 },
+                        input_audio_format: 'g711_ulaw',
+                        output_audio_format: 'g711_ulaw',
+                        modalities: ['text', 'audio'],
+                        temperature: 0.6,
+                        input_audio_transcription: { model: 'whisper-1' },
+                        instructions: greetingInstructions,
+                        voice: 'shimmer',
+                    }
+                };
+                realtimeWS.send(JSON.stringify(fastSessionUpdate));
+
+                await plivoWS.startPromise;
+                const t0 = Date.now();
+                realtimeWS.send(JSON.stringify({ type: 'response.create' }));
+                logger.info('Greeting dispatched (fast path)', { callSid, msFromConnect: t0 - callStartTime });
+                resetSilenceTimer();
+
+                // Kick off Plivo-side recording. Plivo's <Stream> doesn't record by itself —
+                // we trigger it via API so the recording callback fires with a recording_url.
+                plivoClient.calls.record(callSid, {
+                    callback_url: `${process.env.WEBSOCKET_SERVER_URL}/recording`,
+                    callback_method: 'POST',
+                    file_format: 'mp3',
+                }).then(r => {
+                    logger.info('Recording started', { callSid, recordingId: r?.recordingId || r?.recording_id });
+                }).catch(err => {
+                    logger.error('Recording start failed', { callSid, error: err.message });
+                });
+
+                // 2b. Now wait for full context — runs in background while greeting plays.
                 const [{ data: context, error: contextError }, { data: campaignData, error: campaignError }] = await contextPromise;
-                
+
                 if (contextError || campaignError || !context || !campaignData) {
                     logger.error('Context fetch failed', { callSid, leadError: contextError?.message, campaignError: campaignError?.message });
+                    // Greeting already playing; tear down after it finishes naturally via close handlers.
                     realtimeWS.close();
                     try { await plivoClient.calls.hangup(callSid); } catch (_) {}
                     plivoWS.close();
@@ -175,14 +242,12 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                     return;
                 }
 
-                // Derive campaign projects (junction table rows); backward-compat fallback to lead's project
                 let campaignProjects = campaign.campaign_projects?.map(cp => cp.project).filter(Boolean) || [];
                 if (campaignProjects.length === 0 && campaign.project_id) {
                     campaignProjects = [context.project].filter(Boolean);
                 }
                 campaignProjectIds = campaignProjects.map(p => p.id);
 
-                // Snapshot lead preferences for the inventory tool's relevance ranking
                 leadHints = {
                     preferred_configuration: context.preferred_configuration,
                     preferred_category: context.preferred_category,
@@ -192,20 +257,14 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                     preferred_timeline: context.preferred_timeline,
                 };
 
-                // 3. Org projects & campaign available units were fetching in parallel — await both.
                 const [allOrgProjects, campaignUnits] = await Promise.all([orgProjectsPromise, campaignUnitsPromise]);
 
-                // 4. Send session update first, then wait for Plivo stream to be ready
-                // before triggering the greeting — otherwise the opening audio chunks are
-                // emitted before Plivo can play them and the lead hears nothing until they speak.
+                // Send the full session.update — replaces the minimal greeting prompt for turn 2 onwards.
+                // OpenAI Realtime applies session updates immediately; any in-flight greeting completes
+                // under the original instructions, which is what we want.
                 const sessionUpdate = createSessionUpdate(context, campaign, campaignProjects, allOrgProjects, campaignUnits);
                 realtimeWS.send(JSON.stringify(sessionUpdate));
-
-                await plivoWS.startPromise;
-                const t0 = Date.now();
-                realtimeWS.send(JSON.stringify({ type: 'response.create' }));
-                logger.info('Greeting dispatched', { callSid, msFromConnect: t0 - callStartTime, promptBytes: sessionUpdate.session.instructions.length });
-                resetSilenceTimer();
+                logger.info('Full session prompt installed', { callSid, msFromConnect: Date.now() - callStartTime, promptBytes: sessionUpdate.session.instructions.length });
 
                 // Resolve call log ID in background; tools that need it will find it set.
                 logCallStart(context, campaign, callSid).then(async id => {
