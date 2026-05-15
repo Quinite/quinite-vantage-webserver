@@ -196,7 +196,21 @@ export async function finalizeCallOutcome(callLogId, leadId, campaignId, transcr
 
         // Create WhatsApp brochure task if lead requested it during the call
         if (finalLog?.ai_metadata?.whatsapp_brochure_requested && leadData?.assigned_to) {
-            const interestedProjectId = finalLog.ai_metadata?.interested_project_id || leadData.project_id || null;
+            // Resolve project for the brochure task in priority order:
+            //   1. AI-set interested_project_id (multi-project: AI must ask which)
+            //   2. Lead's registered project
+            //   3. The campaign's first project (so brochure isn't orphaned in multi-project campaigns)
+            let interestedProjectId = finalLog.ai_metadata?.interested_project_id || leadData.project_id || null;
+            if (!interestedProjectId && campaignId) {
+                const { data: firstCp } = await supabase
+                    .from('campaign_projects')
+                    .select('project_id')
+                    .eq('campaign_id', campaignId)
+                    .order('created_at', { ascending: true })
+                    .limit(1)
+                    .maybeSingle();
+                interestedProjectId = firstCp?.project_id || null;
+            }
             const { data: brochureTask } = await supabase.from('tasks').insert({
                 lead_id: leadId,
                 organization_id: organizationId,
