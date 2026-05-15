@@ -170,23 +170,48 @@ export async function handleDetailedInventory(leadId, args, context = {}) {
     };
 }
 
+// English word for small integers — disambiguates digits for TTS so "75" can't be heard as "50".
+const NUM_WORDS = {
+    0: 'zero', 1: 'one', 2: 'two', 3: 'three', 4: 'four', 5: 'five', 6: 'six', 7: 'seven', 8: 'eight', 9: 'nine',
+    10: 'ten', 11: 'eleven', 12: 'twelve', 13: 'thirteen', 14: 'fourteen', 15: 'fifteen', 16: 'sixteen',
+    17: 'seventeen', 18: 'eighteen', 19: 'nineteen', 20: 'twenty', 30: 'thirty', 40: 'forty', 50: 'fifty',
+    60: 'sixty', 70: 'seventy', 80: 'eighty', 90: 'ninety'
+};
+function numWord(n) {
+    if (n in NUM_WORDS) return NUM_WORDS[n];
+    if (n < 100) {
+        const tens = Math.floor(n / 10) * 10;
+        const ones = n % 10;
+        return `${NUM_WORDS[tens]}-${NUM_WORDS[ones]}`;
+    }
+    return String(n);
+}
+
 // Convert a raw INR amount into a SPOKEN string with the lakh/crore unit baked in.
 // The AI must read this verbatim — never re-convert. This prevents "75 lakh" being
-// misspoken as "75 crore" (a 100× error) by giving the model an unambiguous token.
+// misspoken as "75 crore" (a 100× error) or "50 lakh" (a TTS-mishearing error).
+// We spell the number in words AND include a clarifier so TTS produces unambiguous audio.
 function priceSpoken(amount) {
     const n = Number(amount);
     if (!n || isNaN(n)) return null;
     if (n >= 10000000) {
-        const cr = +(n / 10000000).toFixed(2);
-        return `${cr} crore`;
+        const crVal = n / 10000000;
+        if (crVal % 1 === 0 && crVal < 100) {
+            return `${numWord(crVal)} crore rupees`;
+        }
+        return `${(+crVal.toFixed(2))} crore rupees`;
     }
     if (n >= 100000) {
-        const lk = +(n / 100000).toFixed(2);
-        return `${lk} lakh`;
+        const lkVal = n / 100000;
+        if (lkVal % 1 === 0 && lkVal < 100) {
+            // e.g. "seventy-five lakh rupees" — words form is much harder for TTS to garble than digits.
+            return `${numWord(lkVal)} lakh rupees`;
+        }
+        return `${(+lkVal.toFixed(2))} lakh rupees`;
     }
     if (n >= 1000) {
         const k = +(n / 1000).toFixed(1);
-        return `${k} thousand`;
+        return `${k} thousand rupees`;
     }
     return `${n} rupees`;
 }

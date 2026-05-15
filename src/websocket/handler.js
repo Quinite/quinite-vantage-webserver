@@ -114,6 +114,9 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
         // Backstop: scheduled disconnect after AI says a farewell line. Cleared if the lead
         // speaks again (false alarm — conversation continued).
         let farewellDisconnectTimer = null;
+        // Timestamp of the most recent tool call. The farewell backstop uses this to avoid
+        // hanging up while a multi-tool turn (e.g. book_site_visit + log_intent) is still firing.
+        let lastToolCallAt = 0;
 
         // Shared context lifted to the outer scope so the message handler (registered
         // outside the open handler) can access them when dispatching tool calls.
@@ -340,6 +343,7 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                     case 'response.function_call_arguments.done': {
                         const { name, arguments: argsJson, call_id } = response;
                         const args = JSON.parse(argsJson);
+                        lastToolCallAt = Date.now();
 
                         // Mid-call credit pulse check (skip if context not yet ready)
                         if (!organization?.id) {
@@ -443,17 +447,33 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                     case 'response.audio_transcript.done':
                         conversationTranscript += `AI: ${response.transcript}\n`;
                         // Backstop: if the AI clearly said a farewell line but didn't call disconnect_call,
-                        // auto-disconnect ~2.5s later (after the goodbye audio finishes playing).
-                        // Without this the line stays open in awkward silence until the 25s silence timer.
+                        // auto-disconnect after a delay (so the goodbye audio finishes playing AND any
+                        // in-flight tool calls — e.g. book_site_visit + log_intent fired in the same turn —
+                        // get a chance to complete). Without this the line stays open in awkward silence
+                        // until the 25s silence timer.
                         if (!farewellDisconnectTimer && isFarewell(response.transcript)) {
                             logger.info('Farewell detected in AI transcript — scheduling auto-disconnect', { callSid, transcript: response.transcript });
-                            farewellDisconnectTimer = setTimeout(async () => {
+                            const tryDisconnect = async () => {
+                                // Defer if a tool call was made recently — let it finish.
+                                const sinceLastTool = Date.now() - lastToolCallAt;
+                                if (lastToolCallAt > 0 && sinceLastTool < 3000) {
+                                    logger.info('Farewell disconnect deferred — tool call in flight', { callSid, sinceLastTool });
+                                    farewellDisconnectTimer = setTimeout(tryDisconnect, 1500);
+                                    return;
+                                }
+                                // Defer if the AI is mid-response (still generating audio).
+                                if (responseActive) {
+                                    logger.info('Farewell disconnect deferred — response still active', { callSid });
+                                    farewellDisconnectTimer = setTimeout(tryDisconnect, 1000);
+                                    return;
+                                }
                                 try {
                                     await handleDisconnect(plivoWS, realtimeWS, callSid, leadId, { reason: 'completed' }, callLogId);
                                 } catch (e) {
                                     logger.error('Auto-disconnect after farewell failed', { callSid, error: e.message });
                                 }
-                            }, 2500);
+                            };
+                            farewellDisconnectTimer = setTimeout(tryDisconnect, 4000);
                         }
                         break;
 
