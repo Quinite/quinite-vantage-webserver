@@ -5,31 +5,6 @@ import { createSessionUpdate } from '../../sessionUpdate.js';
 import { logCallStart, finalizeCallOutcome } from '../lib/callLifecycle.js';
 import { getCachedContext, setCachedContext } from '../lib/contextCache.js';
 import { dispatchTool } from '../tools/index.js';
-import { handleDisconnect } from '../tools/disconnect.js';
-
-// Detects farewell/closing utterances in the AI's transcript so we can force a hangup
-// if the model said goodbye but forgot to call disconnect_call.
-const FAREWELL_PATTERNS = [
-    /\bhave a (nice|good|great) (day|evening)\b/i,
-    /\bbye[\s,!.]/i,
-    /\bgoodbye\b/i,
-    /\btake care\b/i,
-    /\bthank you (for your time|so much)\b/i,
-    /\bphir baat karte\b/i,
-    /\brakh deti hoon\b/i,
-    /\brakh rahi hoon\b/i,
-    /\bdhanyavaad\b/i,
-    /\bshukriya\b/i,
-    /\baabhar\b/i,
-    /\baavjo\b/i,
-    /\bnamaste[\s,!.]*$/i,
-    /\bcall karte hain\b/i,
-    /\bbaat karte hain\b/i,
-];
-function isFarewell(t) {
-    if (!t) return false;
-    return FAREWELL_PATTERNS.some(re => re.test(t));
-}
 import { logger } from '../lib/logger.js';
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -111,9 +86,6 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
         // Debounce cancel: only cancel AI if user speech is sustained (>300ms), not brief
         // backchannel affirmations like "haa", "acha", "hmm" common in Indian conversations.
         let cancelDebounce = null;
-        // Backstop: scheduled disconnect after AI says a farewell line. Cleared if the lead
-        // speaks again (false alarm — conversation continued).
-        let farewellDisconnectTimer = null;
 
         // Shared context lifted to the outer scope so the message handler (registered
         // outside the open handler) can access them when dispatching tool calls.
@@ -152,7 +124,6 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
             cleanupCalled = true;
             clearTimeout(startupTimeout);
             if (silenceTimer) clearTimeout(silenceTimer);
-            if (farewellDisconnectTimer) clearTimeout(farewellDisconnectTimer);
             if (keepalive) clearInterval(keepalive);
             if (realtimeWS.readyState === WebSocket.OPEN) realtimeWS.close();
 
@@ -396,11 +367,6 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
 
                     case 'input_audio_buffer.speech_started':
                         resetSilenceTimer();
-                        // Lead is speaking again — false alarm on the farewell, conversation continues.
-                        if (farewellDisconnectTimer) {
-                            clearTimeout(farewellDisconnectTimer);
-                            farewellDisconnectTimer = null;
-                        }
                         // Debounce: wait 320ms before cancelling the AI response.
                         // Brief Indian backchannels ("haa", "acha", "hmm") are typically
                         // under 300ms and should not interrupt the AI mid-sentence.
@@ -442,19 +408,6 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
 
                     case 'response.audio_transcript.done':
                         conversationTranscript += `AI: ${response.transcript}\n`;
-                        // Backstop: if the AI clearly said a farewell line but didn't call disconnect_call,
-                        // auto-disconnect ~2.5s later (after the goodbye audio finishes playing).
-                        // Without this the line stays open in awkward silence until the 25s silence timer.
-                        if (!farewellDisconnectTimer && isFarewell(response.transcript)) {
-                            logger.info('Farewell detected in AI transcript — scheduling auto-disconnect', { callSid, transcript: response.transcript });
-                            farewellDisconnectTimer = setTimeout(async () => {
-                                try {
-                                    await handleDisconnect(plivoWS, realtimeWS, callSid, leadId, { reason: 'completed' }, callLogId);
-                                } catch (e) {
-                                    logger.error('Auto-disconnect after farewell failed', { callSid, error: e.message });
-                                }
-                            }, 2500);
-                        }
                         break;
 
                     case 'error':
