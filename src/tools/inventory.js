@@ -170,9 +170,31 @@ export async function handleDetailedInventory(leadId, args, context = {}) {
     };
 }
 
+// Convert a raw INR amount into a SPOKEN string with the lakh/crore unit baked in.
+// The AI must read this verbatim — never re-convert. This prevents "75 lakh" being
+// misspoken as "75 crore" (a 100× error) by giving the model an unambiguous token.
+function priceSpoken(amount) {
+    const n = Number(amount);
+    if (!n || isNaN(n)) return null;
+    if (n >= 10000000) {
+        const cr = +(n / 10000000).toFixed(2);
+        return `${cr} crore`;
+    }
+    if (n >= 100000) {
+        const lk = +(n / 100000).toFixed(2);
+        return `${lk} lakh`;
+    }
+    if (n >= 1000) {
+        const k = +(n / 1000).toFixed(1);
+        return `${k} thousand`;
+    }
+    return `${n} rupees`;
+}
+
 function formatUnit(u) {
     // Unit-level flag takes precedence; only fall back to config if unit flag is null/undefined
     const priceHidden = u.price_undisclosed != null ? u.price_undisclosed : (u.config?.price_undisclosed ?? false);
+    const rawPrice = u.total_price || u.base_price;
     return {
         unit_id: u.id,
         unit_no: u.unit_number,
@@ -191,7 +213,9 @@ function formatUnit(u) {
             super_built: u.config?.super_built_up_area,
             plot: u.config?.plot_area
         },
-        price: priceHidden ? 'PRICE_UNDISCLOSED' : (u.total_price || u.base_price),
+        price: priceHidden ? 'PRICE_UNDISCLOSED' : rawPrice,
+        // Pre-rendered spoken form — READ THIS VERBATIM. Do NOT re-convert from `price`.
+        price_spoken: priceHidden ? null : priceSpoken(rawPrice),
         facing: u.facing,
         vastu: u.is_vastu_compliant ? 'Yes' : 'No',
         corner_unit: u.is_corner ? 'Yes' : 'No',
