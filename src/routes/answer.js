@@ -2,6 +2,7 @@ import express from 'express';
 import plivo from 'plivo';
 import { supabase } from '../../services/supabase.js';
 import { logger } from '../lib/logger.js';
+import { prewarmRealtime } from '../lib/realtimePrewarm.js';
 
 const router = express.Router();
 
@@ -46,6 +47,10 @@ router.all('/', async (req, res) => {
         logger.warn('Call rejected at answer', { callUuid, campaignStatus, subStatus, balance });
         return res.set('Content-Type', 'text/xml').send('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>');
     }
+
+    // Pre-warm OpenAI Realtime WS now — the ~1-1.5s handshake overlaps with
+    // Plivo dialing the media stream, so it's already open when the WS connects.
+    prewarmRealtime(callUuid);
 
     const host = req.headers.host;
     const wsUrl = `wss://${host}/voice/stream?leadId=${leadId}&campaignId=${campaignId}&callSid=${callUuid}`;
