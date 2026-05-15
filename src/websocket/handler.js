@@ -6,23 +6,18 @@ import { logCallStart, finalizeCallOutcome } from '../lib/callLifecycle.js';
 import { getCachedContext, setCachedContext } from '../lib/contextCache.js';
 import { dispatchTool } from '../tools/index.js';
 import { logger } from '../lib/logger.js';
-import { consumePrewarm } from '../lib/realtimePrewarm.js';
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, callSid) {
     try {
-        // 1. Reuse the OpenAI Realtime WS pre-warmed at /answer if available —
-        // its handshake overlapped with Plivo's dial, so it's likely already open.
-        // Fallback: open a fresh one (e.g. for calls without a prewarm step).
-        const prewarmed = consumePrewarm(callSid);
-        const realtimeWS = prewarmed?.ws || new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview', {
+        // 1. Start OpenAI WS and DB context fetches in parallel IMMEDIATELY
+        const realtimeWS = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview', {
             headers: {
                 'Authorization': `Bearer ${OPENAI_API_KEY}`,
                 'OpenAI-Beta': 'realtime=v1'
             }
         });
-        const prewarmAlreadyOpen = prewarmed?.isOpen?.() === true;
 
         // Fast greeting query — only the columns the opening line needs.
         // Resolves in ~100-200ms so we can start the AI talking ASAP after WS open.
@@ -156,10 +151,10 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
         let resolveSessionReady;
         const sessionReadyPromise = new Promise(r => { resolveSessionReady = r; });
 
-        const onRealtimeOpen = async () => {
+        realtimeWS.on('open', async () => {
             try {
                 clearTimeout(startupTimeout);
-                logger.info('OpenAI WS ready', { callSid, prewarmed: prewarmAlreadyOpen });
+                logger.info('OpenAI WS ready', { callSid });
 
                 // 2a. Wait for the FAST greeting query (lead name + campaign org/projects).
                 // This typically resolves in ~100-200ms so the AI can start speaking quickly
@@ -296,16 +291,7 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                 try { await plivoClient.calls.hangup(callSid); } catch (_) {}
                 plivoWS.close();
             }
-        };
-
-        if (prewarmAlreadyOpen) {
-            // The prewarmed WS already fired 'open' before we attached our listener.
-            // Invoke the handler directly on next tick so the rest of the setup
-            // (message listener, error listener) is wired first.
-            setImmediate(onRealtimeOpen);
-        } else {
-            realtimeWS.on('open', onRealtimeOpen);
-        }
+        });
 
         realtimeWS.on('pong', () => {});
 
