@@ -77,13 +77,38 @@ export const createSessionUpdate = (context, campaign, campaignProjects = [], al
     if (propDetails) knownPrefs.push(`Looking for: ${propDetails}`);
     if (lead.preferred_transaction_type) knownPrefs.push(`Transaction: Wants to ${lead.preferred_transaction_type}`);
     if (lead.preferred_location) knownPrefs.push(`Preferred Area: ${lead.preferred_location}`);
+    // Price formatter — outputs in spoken word form to prevent TTS digit-confusion
+    // (e.g. "75" being heard as "50"). The AI reads these strings verbatim.
+    const NUM_WORDS = {
+        0: 'zero', 1: 'one', 2: 'two', 3: 'three', 4: 'four', 5: 'five', 6: 'six', 7: 'seven', 8: 'eight', 9: 'nine',
+        10: 'ten', 11: 'eleven', 12: 'twelve', 13: 'thirteen', 14: 'fourteen', 15: 'fifteen', 16: 'sixteen',
+        17: 'seventeen', 18: 'eighteen', 19: 'nineteen', 20: 'twenty', 30: 'thirty', 40: 'forty', 50: 'fifty',
+        60: 'sixty', 70: 'seventy', 80: 'eighty', 90: 'ninety'
+    };
+    const numWord = (n) => {
+        if (n in NUM_WORDS) return NUM_WORDS[n];
+        if (n < 100) {
+            const tens = Math.floor(n / 10) * 10;
+            const ones = n % 10;
+            return `${NUM_WORDS[tens]}-${NUM_WORDS[ones]}`;
+        }
+        return String(n);
+    };
     const formatMoney = (val) => {
         const num = Number(val);
         if (isNaN(num) || !val) return val;
-        if (num >= 10000000) return `₹${+(num / 10000000).toFixed(2)}Cr`;
-        if (num >= 100000) return `₹${+(num / 100000).toFixed(2)}L`;
-        if (num >= 1000) return `₹${+(num / 1000).toFixed(1)}K`;
-        return `₹${num}`;
+        if (num >= 10000000) {
+            const cr = num / 10000000;
+            if (cr % 1 === 0 && cr < 100) return `${numWord(cr)} crore`;
+            return `${+cr.toFixed(2)} crore`;
+        }
+        if (num >= 100000) {
+            const lk = num / 100000;
+            if (lk % 1 === 0 && lk < 100) return `${numWord(lk)} lakh`;
+            return `${+lk.toFixed(2)} lakh`;
+        }
+        if (num >= 1000) return `${+(num / 1000).toFixed(1)} thousand`;
+        return `${num} rupees`;
     };
 
     if (lead.budget_range || (lead.min_budget && lead.max_budget)) {
@@ -251,6 +276,7 @@ PRONUNCIATION RULES — read these tokens as natural speech, NEVER spell them ou
 - "floor 0" / floor_number = 0 → ALWAYS say "ground floor". Never "floor zero" or "zeroth floor".
 - "floor 1" → "first floor", "floor 2" → "second floor", etc. — use ordinal English/Hindi/Gujarati form, never "floor one".
 - Prices: "₹1.2Cr" → "one point two crore", "₹85L" → "eighty-five lakh". Never read the symbol "₹" or the letter "L"/"Cr" as letters.
+- CRITICAL — PRICES: the tool and PROJECT INFO give prices in SPOKEN WORD FORM (e.g. "seventy-five lakh rupees", "one point two crore rupees"). READ THESE VERBATIM. Do NOT convert to digits in your head — saying "seventy-five" as "75" lets TTS render it as "50" or similar. Always speak the FULL word form exactly as given. The number word + unit word together is what makes the price intelligible — never drop the unit (lakh / crore / rupees), never substitute a digit. Example: "price_spoken": "seventy-five lakh rupees" → you say "seventy-five lakh rupees" or in Hinglish "pichhattar lakh rupaye". If unsure, repeat the price once more for clarity: "seventy-five lakh — yaani pichhattar lakh."
 - RERA / phone numbers: read digit by digit, grouped naturally.
 
 ENERGY:
@@ -358,7 +384,7 @@ CRITICAL: Each CTA appears AT MOST ONCE per call, with ONE exception: after a si
 # TOOL RULES
 - BEFORE check_detailed_inventory / book_site_visit / transfer_call: say a SHORT verbal filler so the lead doesn't hear awkward silence. Examples: "Ek minute, check karke batati hoon" / "Hold on, let me check that for you" / "Ek second ji". Then call the tool. NEVER silently call a tool that takes >1 second — always announce.
 - log_intent, schedule_callback, disconnect_call: these are FAST and silent. Don't announce them. Just call them after the relevant moment in the conversation.
-- check_detailed_inventory: ALWAYS call before saying anything about availability. Use config_name for BHK. From the result, quote ONLY the top 2 matches (match_rank 1 and 2) in voice — one sentence each. MANDATORY — after listing the units, in the SAME turn you MUST offer a CTA. Pick exactly ONE: (a) site visit if lead sounds engaged: "In mein se ek dekhne aana chahenge? Weekday ya weekend better hai?" → then book_site_visit flow, OR (b) brochure with details if lead is still evaluating: "Main in units ke details aur photos WhatsApp pe bhej deti hoon — aaram se dekh sakte ho." → then log_intent(whatsapp_brochure=true, interested_project_id=...). NEVER end an inventory turn with just the unit list and silence — that kills momentum. Listing units WITHOUT a CTA in the same turn is a critical mistake.
+- check_detailed_inventory: ALWAYS call before saying anything about availability. Use config_name for BHK. From the result, quote ONLY the top 2 matches (match_rank 1 and 2) in voice — one sentence each, using each unit's price_spoken value verbatim. MANDATORY — after listing the units, in the SAME turn you MUST offer a CTA. Pick exactly ONE: (a) site visit if lead sounds engaged: "In mein se ek dekhne aana chahenge? Weekday ya weekend better hai?" → then book_site_visit flow, OR (b) brochure with details if lead is still evaluating: "Main in units ke details aur photos WhatsApp pe bhej deti hoon — aaram se dekh sakte ho." → then log_intent(whatsapp_brochure=true, interested_project_id=...). NEVER end an inventory turn with just the unit list and silence — that kills momentum. Listing units WITHOUT a CTA in the same turn is a critical mistake.
 - log_intent: Call silently after each qualification answer (purpose, budget, timeline, BHK, location). Also for whatsapp_brochure=true.
 - book_site_visit: Call ONLY after lead confirms specific date AND time. Pass unit_id if they liked a specific unit from inventory.
 - schedule_callback: ISO 8601 IST format. Example tomorrow 5pm: "${tomorrowISO}T17:00:00+05:30"
