@@ -460,6 +460,26 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
 
                     case 'response.audio_transcript.done':
                         conversationTranscript += `AI: ${response.transcript}\n`;
+                        // Safety net: the Realtime model frequently announces a handoff verbally
+                        // ("connect kar rahi hoon", "connecting you now") but fails to invoke the
+                        // transfer_call tool. If we detect the verbal handoff and the tool was
+                        // NOT called, fire the transfer ourselves so the lead doesn't get stuck.
+                        if (!plivoWS.transferInProgress && organization?.id) {
+                            const t = (response.transcript || '').toLowerCase();
+                            const handoffPhrases = [
+                                'connect kar rahi hoon', 'connect kar rahi hu', 'connect kar rahi',
+                                'connect karti hoon', 'connect karti hu', 'connect karti',
+                                'connecting you', 'connecting now', 'transferring you',
+                                'transfer kar rahi', 'senior se baat kar', 'senior team se connect',
+                                'ek minute hold', 'hold karein, connect',
+                            ];
+                            if (handoffPhrases.some(p => t.includes(p))) {
+                                logger.warn('Verbal handoff detected without tool call — firing transfer server-side', { callSid, transcript: response.transcript });
+                                dispatchTool('transfer_call', { reason: 'Auto-detected verbal handoff' }, { plivoWS, realtimeWS, callSid, leadId, campaignId, callLogId, organizationId: organization?.id, campaignProjectIds, leadHints }).catch(err => {
+                                    logger.error('Auto-transfer dispatch failed', { callSid, error: err.message });
+                                });
+                            }
+                        }
                         break;
 
                     case 'error':
