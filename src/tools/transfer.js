@@ -4,6 +4,14 @@ import { firePipelineTrigger, TRIGGER_KEYS } from '../lib/pipelineTriggers.js';
 import { logger } from '../lib/logger.js';
 
 export async function handleTransfer(plivoWS, realtimeWS, callSid, leadId, campaignId, args, callLogId) {
+    // Idempotency guard: if a transfer is already in progress for this call, drop the
+    // duplicate invocation immediately. Prevents double-dial when both the model AND
+    // the transcript safety net fire transfer_call.
+    if (plivoWS.transferInProgress) {
+        logger.info('Transfer already in progress — ignoring duplicate invocation', { callSid });
+        return { success: true, note: 'transfer already in progress' };
+    }
+    plivoWS.transferInProgress = true;
     const [{ data: lead }, { data: campaign }] = await Promise.all([
         supabase.from('leads')
             .select('name, phone, interest_level, score, organization_id, assigned_to')
@@ -50,13 +58,14 @@ export async function handleTransfer(plivoWS, realtimeWS, callSid, leadId, campa
         }
     }
 
-    if (!targetPhone) targetPhone = process.env.PLIVO_TRANSFER_NUMBER;
-    if (!targetPhone) return { success: false, error: 'No available agent phone numbers configured.' };
-
-    // Mark the call as in-transfer so disconnect_call becomes a no-op for the rest
-    // of this session. Prevents the AI's "have a nice day" reflex from hanging up
-    // the lead between transfer_call and the actual conference redirect.
-    plivoWS.transferInProgress = true;
+    if (!targetPhone) {
+        targetPhone = process.env.PLIVO_TRANSFER_NUMBER;
+    }
+    if (!targetPhone) {
+        // No agent available — release the guard so a retry can happen
+        plivoWS.transferInProgress = false;
+        return { success: false, error: 'No available agent phone numbers configured.' };
+    }
 
     // ── Build briefing text spoken to agent before bridging ──────────────────
     const interestLabel = lead.interest_level
@@ -116,6 +125,12 @@ export async function handleTransfer(plivoWS, realtimeWS, callSid, leadId, campa
 
     const executeTransfer = async () => {
         try {
+            // Detach the AI side BEFORE redirecting the lead. Once the lead is in
+            // the conference, the OpenAI Realtime socket has no useful role — keeping
+            // it open means VAD silence timers and stray transcripts can re-fire tools.
+            try { plivoWS.aiDetached = true; } catch (_) {}
+            try { realtimeWS?.close(); } catch (_) {}
+
             // 1. Redirect the lead's A-leg to the conference holding room
             await plivoClient.calls.transfer(callSid, {
                 legs: 'aleg',

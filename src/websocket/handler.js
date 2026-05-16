@@ -134,7 +134,12 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
 
         const resetSilenceTimer = () => {
             if (silenceTimer) clearTimeout(silenceTimer);
+            // If we've detached from the AI (e.g. transfer in progress), silence is expected —
+            // never fire disconnect_call. The lead is in a conference now and has nothing to
+            // say TO the AI.
+            if (plivoWS.aiDetached || plivoWS.transferInProgress) return;
             silenceTimer = setTimeout(async () => {
+                if (plivoWS.aiDetached || plivoWS.transferInProgress) return;
                 logger.info('Silence timeout — disconnecting', { callSid, timeoutSec: silenceTimeoutMs / 1000 });
                 const { handleDisconnect } = await import('../tools/disconnect.js');
                 await handleDisconnect(plivoWS, realtimeWS, callSid, leadId, { reason: 'silence' }, callLogId);
