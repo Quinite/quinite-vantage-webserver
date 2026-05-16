@@ -29,6 +29,7 @@ export const createSessionUpdate = (context, campaign, campaignProjects = [], al
             minPrice: null,
             maxPrice: null,
             floorCounts: {}, // { floorNumber: count } — lets AI answer "X floor pe kya hai" exactly
+            undisclosedFloors: new Set(), // floors where at least one unit is price_undisclosed
         });
         entry.count++;
         const price = !u.price_undisclosed && (u.total_price || u.base_price) || null;
@@ -38,6 +39,7 @@ export const createSessionUpdate = (context, campaign, campaignProjects = [], al
         }
         if (u.floor_number != null) {
             entry.floorCounts[u.floor_number] = (entry.floorCounts[u.floor_number] || 0) + 1;
+            if (u.price_undisclosed) entry.undisclosedFloors.add(u.floor_number);
         }
     }
 
@@ -187,7 +189,11 @@ After EACH answer call log_intent silently. After timeline, pitch the most relev
                 let floors = '';
                 if (floorEntries.length) {
                     const floorLabel = (f) => f === 0 ? 'ground floor' : `floor ${f}`;
-                    const display = floorEntries.slice(0, 12).map(([f, c]) => c > 1 ? `${floorLabel(f)} (${c})` : floorLabel(f)).join(', ');
+                    const display = floorEntries.slice(0, 12).map(([f, c]) => {
+                        const label = floorLabel(f);
+                        const undisclosed = b.undisclosedFloors.has(f) ? ' [price undisclosed]' : '';
+                        return c > 1 ? `${label} (${c})${undisclosed}` : `${label}${undisclosed}`;
+                    }).join(', ');
                     const more = floorEntries.length > 12 ? ` (+${floorEntries.length - 12} more)` : '';
                     floors = ` on ${display}${more}`;
                 }
@@ -397,6 +403,7 @@ ${campaign?.ai_script || 'Help the lead find their ideal property. Be genuine, h
 11. Match the lead's language (English / Hindi / Gujarati / other) from turn 2 onwards. Turn 1 is always Hinglish.
 12. Treat the example sentences in this prompt as templates, not lines to copy verbatim. ALWAYS phrase your reply in the lead's CURRENT language — never leave English fragments like "still looking", "right", "okay" inside a Hindi/Gujarati reply (use "abhi bhi dekh rahe ho", "theek hai", "haan ji" instead).
 13. When the lead asks about FLOORS ("X floor pe hai kya", "kaunse floor available hain"): answer ONLY from the floor list in the Available Units summary for the relevant project above. If a floor isn't in that list for the config they want, say honestly "us floor pe abhi available nahi hai, [list available floors] pe options hain". For specific unit details (facing, unit number, exact area), call check_detailed_inventory — do not guess.
+14. PRICE_UNDISCLOSED is per-UNIT, NOT per-bucket. If a floor in the Available Units summary is tagged "[price undisclosed]", the unit on THAT floor has no public price — do NOT quote the bucket's "from ₹X" range for it. Say: "Is floor ke unit ki pricing senior team confirm karke deti hai — main aapko unse connect kar sakti hoon ya callback schedule kar dun?" Bucket min/max ranges apply ONLY to units WITHOUT the [price undisclosed] tag. Never blend the two.
 `.trim();
 
     return {
@@ -404,7 +411,7 @@ ${campaign?.ai_script || 'Help the lead find their ideal property. Be genuine, h
         session: {
             turn_detection: {
                 type: 'server_vad',
-                threshold: 0.55,
+                threshold: 0.75,
                 prefix_padding_ms: 150,
                 silence_duration_ms: silenceDurationMs
             },
