@@ -131,13 +131,14 @@ export async function handleTransfer(plivoWS, realtimeWS, callSid, leadId, campa
             try { plivoWS.aiDetached = true; } catch (_) {}
             try { realtimeWS?.close(); } catch (_) {}
 
-            // 1. Redirect the lead's A-leg to the conference holding room
-            // NOTE: Plivo Node SDK requires camelCase params (alegUrl, alegMethod).
-            // Snake-case (aleg_url) is silently accepted by the SDK but ignored by the
-            // Plivo API — the call returns "success" but no redirect actually happens.
+            // 1. Redirect the lead's A-leg to the conference holding room.
+            // Plivo Node SDK passes params as-is; Plivo's REST API expects snake_case.
+            // We send both forms to cover SDK quirks across versions.
             logger.info('Calling plivo.calls.transfer', { callSid, conferenceXmlUrl });
             const transferResp = await plivoClient.calls.transfer(callSid, {
                 legs: 'aleg',
+                aleg_url: conferenceXmlUrl,
+                aleg_method: 'GET',
                 alegUrl: conferenceXmlUrl,
                 alegMethod: 'GET',
             });
