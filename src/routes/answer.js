@@ -51,15 +51,15 @@ router.all('/', async (req, res) => {
     const wsUrl = `wss://${host}/voice/stream?leadId=${leadId}&campaignId=${campaignId}&callSid=${callUuid}`;
     const xmlWsUrl = wsUrl.replace(/&/g, '&amp;');
 
-    // keepCallAlive=false: when our WebSocket closes, Plivo treats the Stream as complete
-    // and continues to <Redirect>, which calls /after-stream. That route inspects shared
+    // keepCallAlive=true: when our WebSocket closes, Plivo keeps the call alive and
+    // continues to <Redirect>, which calls /after-stream. That route inspects shared
     // state to decide whether to <Dial> an agent (transfer) or <Hangup>.
     // This is the only way to redirect a streaming call — Plivo's REST transfer API
-    // does NOT work on calls inside <Stream keepCallAlive>.
+    // does NOT work on calls inside <Stream>.
     const afterStreamUrl = `https://${host}/after-stream?callSid=${callUuid}`;
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Stream bidirectional="true" keepCallAlive="false" contentType="audio/x-mulaw;rate=8000">${xmlWsUrl}</Stream>
+    <Stream bidirectional="true" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000">${xmlWsUrl}</Stream>
     <Redirect>${afterStreamUrl.replace(/&/g, '&amp;')}</Redirect>
 </Response>`;
 
