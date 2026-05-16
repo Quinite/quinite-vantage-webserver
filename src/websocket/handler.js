@@ -85,6 +85,7 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
         let greetingProtected = true; // do not let user speech cancel the greeting (turn 1)
         let resolveGreetingDone;
         const greetingDonePromise = new Promise(r => { resolveGreetingDone = r; });
+        let firstAudioDeltaLogged = false;
         let silenceTimeoutMs = 25000; // Default until campaign context loads
         // Debounce cancel: only cancel AI if user speech is sustained (>300ms), not brief
         // backchannel affirmations like "haa", "acha", "hmm" common in Indian conversations.
@@ -157,12 +158,13 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
         realtimeWS.on('open', async () => {
             try {
                 clearTimeout(startupTimeout);
-                logger.info('OpenAI WS ready', { callSid });
+                logger.info('OpenAI WS ready', { callSid, msFromConnect: Date.now() - callStartTime });
 
                 // 2a. Wait for the FAST greeting query (lead name + campaign org/projects).
                 // This typically resolves in ~100-200ms so the AI can start speaking quickly
                 // instead of waiting for the heavy contextPromise (~500-1500ms).
                 const [{ data: leadLite, error: leadLiteErr }, { data: campLite, error: campLiteErr }] = await greetingPromise;
+                logger.info('Greeting context fetched', { callSid, msFromConnect: Date.now() - callStartTime });
 
                 if (leadLiteErr || campLiteErr || !leadLite || !campLite) {
                     logger.error('Greeting context fetch failed', { callSid, leadErr: leadLiteErr?.message, campErr: campLiteErr?.message });
@@ -198,6 +200,11 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                     }
                 };
                 realtimeWS.send(JSON.stringify(fastSessionUpdate));
+                const sessionSentAt = Date.now();
+                logger.info('Fast session.update sent', { callSid, msFromConnect: sessionSentAt - callStartTime });
+
+                sessionReadyPromise.then(() => logger.info('session.updated ack', { callSid, msFromConnect: Date.now() - callStartTime, waitMs: Date.now() - sessionSentAt }));
+                plivoWS.startPromise.then(() => logger.info('Plivo start event', { callSid, msFromConnect: Date.now() - callStartTime }));
 
                 // Wait for BOTH:
                 //   (a) OpenAI to acknowledge the session.update — sending response.create before
@@ -416,6 +423,10 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                         break;
 
                     case 'response.audio.delta':
+                        if (!firstAudioDeltaLogged) {
+                            firstAudioDeltaLogged = true;
+                            logger.info('First audio delta from OpenAI', { callSid, msFromConnect: Date.now() - callStartTime });
+                        }
                         if (plivoWS.readyState === WebSocket.OPEN) {
                             plivoWS.send(JSON.stringify({
                                 event: 'playAudio',
