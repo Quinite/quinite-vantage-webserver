@@ -6,6 +6,7 @@ import answerRouter from './src/routes/answer.js';
 import recordingRouter from './src/routes/recording.js';
 import statusRouter from './src/routes/status.js';
 import hangupRouter from './src/routes/hangup.js';
+import transferAgentRouter from './src/routes/transferAgent.js';
 import { startRealtimeWSConnection } from './src/websocket/handler.js';
 import { logger } from './src/lib/logger.js';
 
@@ -25,31 +26,19 @@ app.use('/answer', answerRouter);
 app.use('/recording', recordingRouter);
 app.use('/status', statusRouter);
 app.use('/calls', hangupRouter);
-// Transfers the A-leg to a human agent, whispering call context to the agent (B-leg) upon answer
-app.get('/transfer-xml', (req, res) => {
-    const { target, context } = req.query;
-    if (!target) return res.status(400).send('Missing target');
-    res.set('Content-Type', 'text/xml');
+app.use('/transfer-agent', transferAgentRouter);
 
-    if (context) {
-        // Plivo's confirmSound mechanism: the B-leg (agent) hears the whisper audio,
-        // then must press confirmKey to actually connect to the A-leg (lead). Without
-        // confirmKey, Plivo doesn't gate the bridge and the whisper gets dropped/mixed.
-        const whisperUrl = `${process.env.WEBSOCKET_SERVER_URL}/whisper-xml?context=${encodeURIComponent(context)}`;
-        res.send(`<Response><Dial><Number confirmSound="${whisperUrl.replace(/&/g, '&amp;')}" confirmKey="1">${target}</Number></Dial></Response>`);
-    } else {
-        res.send(`<Response><Dial><Number>${target}</Number></Dial></Response>`);
-    }
-});
-
-// Returns Speak XML for whispering context to an agent during transfer
-app.get('/whisper-xml', (req, res) => {
-    const { context } = req.query;
-    res.set('Content-Type', 'text/xml');
-    const speakXml = context
-        ? `<Speak voice="Polly.Joanna">${context.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</Speak>`
-        : '';
-    res.send(`<Response>${speakXml}</Response>`);
+// Conference-room XML — used to put the lead's A-leg into a holding conference
+// while we dial the agent on a separate B-leg. The agent joins the same conference
+// after pressing 1 in the briefing prompt.
+app.all('/conference-xml', (req, res) => {
+    const room = req.query.room;
+    if (!room) return res.status(400).send('Missing room');
+    res.set('Content-Type', 'text/xml').send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Speak voice="Polly.Aditi" language="en-IN">Please hold while I connect you.</Speak>
+    <Conference enterSound="" exitSound="" waitSound="" endConferenceOnExit="false" startConferenceOnEnter="false">${room}</Conference>
+</Response>`);
 });
 
 server.on('upgrade', (request, socket, head) => {

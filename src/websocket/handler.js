@@ -82,6 +82,24 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
         let cleanupCalled = false;
         let keepalive = null;
         let responseActive = false; // tracks whether OpenAI has an active response in-flight
+        // Queue of callbacks to fire after the AI's current response completes — used by
+        // tools like transfer_call that need to wait for the AI's farewell line to finish
+        // playing before redirecting the call. The wait adds ~800ms for Plivo to drain its
+        // player buffer after `response.done` so the last words aren't clipped.
+        const afterResponseQueue = [];
+        plivoWS.scheduleAfterResponse = (fn) => {
+            if (responseActive) {
+                afterResponseQueue.push(fn);
+            } else {
+                // No response in flight — give Plivo time to flush any buffered audio.
+                setTimeout(fn, 1500);
+            }
+        };
+        const drainAfterResponseQueue = () => {
+            if (afterResponseQueue.length === 0) return;
+            const fns = afterResponseQueue.splice(0);
+            setTimeout(() => fns.forEach(fn => { try { fn(); } catch (err) { logger.error('afterResponse callback failed', { error: err.message }); } }), 800);
+        };
         let greetingProtected = true; // do not let user speech cancel the greeting (turn 1)
         let resolveGreetingDone;
         const greetingDonePromise = new Promise(r => { resolveGreetingDone = r; });
@@ -375,6 +393,7 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                         // Once any AI response (the greeting) finishes, normal interruption rules apply.
                         greetingProtected = false;
                         resolveGreetingDone();
+                        drainAfterResponseQueue();
                         // Start measuring lead silence from the moment the AI finishes speaking.
                         resetSilenceTimer();
                         if (response.response?.usage) {
