@@ -6,30 +6,27 @@ import { logCallStart, finalizeCallOutcome } from '../lib/callLifecycle.js';
 import { getCachedContext, setCachedContext } from '../lib/contextCache.js';
 import { dispatchTool } from '../tools/index.js';
 import { logger } from '../lib/logger.js';
-import { consumePrewarm } from '../lib/prewarm.js';
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, callSid) {
     try {
-        // Try to reuse the prewarmed OpenAI WS + DB fetches started in /answer.
-        // If prewarm was missed (e.g. direct dial without our /answer route), fall back
-        // to opening them now — adds ~1.5s vs the prewarm path but still works.
-        const prewarmed = consumePrewarm(callSid);
-
-        const realtimeWS = prewarmed?.realtimeWS || new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview', {
+        // 1. Start OpenAI WS and DB context fetches in parallel IMMEDIATELY
+        const realtimeWS = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview', {
             headers: {
                 'Authorization': `Bearer ${OPENAI_API_KEY}`,
                 'OpenAI-Beta': 'realtime=v1'
             }
         });
 
-        const greetingPromise = prewarmed?.greetingPromise || Promise.all([
+        // Fast greeting query — only the columns the opening line needs.
+        // Resolves in ~100-200ms so we can start the AI talking ASAP after WS open.
+        const greetingPromise = Promise.all([
             supabase.from('leads').select('name').eq('id', leadId).single(),
             supabase.from('campaigns').select('call_settings, organization:organizations!inner(name), campaign_projects(project:projects(name, locality))').eq('id', campaignId).single()
         ]);
 
-        const contextPromise = prewarmed?.contextPromise || Promise.all([
+        const contextPromise = Promise.all([
             supabase.from('leads').select('*, project:projects(*)').eq('id', leadId).single(),
             supabase.from('campaigns').select('*, organization:organizations!inner(id, name, caller_id, subscription_status, call_credits(*)), campaign_projects(project_id, project:projects(id, name, description, address, city, locality, possession_date, rera_number, amenities))').eq('id', campaignId).single()
         ]);
@@ -158,10 +155,10 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
         let resolveSessionReady;
         const sessionReadyPromise = new Promise(r => { resolveSessionReady = r; });
 
-        const onOpen = async () => {
+        realtimeWS.on('open', async () => {
             try {
                 clearTimeout(startupTimeout);
-                logger.info('OpenAI WS ready', { callSid, msFromConnect: Date.now() - callStartTime, prewarmed: !!prewarmed });
+                logger.info('OpenAI WS ready', { callSid, msFromConnect: Date.now() - callStartTime });
 
                 // 2a. Wait for the FAST greeting query (lead name + campaign org/projects).
                 // This typically resolves in ~100-200ms so the AI can start speaking quickly
@@ -317,15 +314,7 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                 try { await plivoClient.calls.hangup(callSid); } catch (_) {}
                 plivoWS.close();
             }
-        };
-
-        // If prewarm already opened the socket before we attached, run immediately.
-        // Otherwise wait for the 'open' event.
-        if (realtimeWS.readyState === WebSocket.OPEN) {
-            onOpen();
-        } else {
-            realtimeWS.on('open', onOpen);
-        }
+        });
 
         realtimeWS.on('pong', () => {});
 

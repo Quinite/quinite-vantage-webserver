@@ -2,7 +2,6 @@ import express from 'express';
 import plivo from 'plivo';
 import { supabase } from '../../services/supabase.js';
 import { logger } from '../lib/logger.js';
-import { prewarmCall } from '../lib/prewarm.js';
 
 const router = express.Router();
 
@@ -46,12 +45,6 @@ router.all('/', async (req, res) => {
     if (!campaignContext || !['active', 'running'].includes(campaignStatus) || !['active', 'trialing'].includes(subStatus) || balance < 0.1) {
         logger.warn('Call rejected at answer', { callUuid, campaignStatus, subStatus, balance });
         return res.set('Content-Type', 'text/xml').send('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>');
-    }
-
-    // Fire-and-forget: open OpenAI WS + start DB fetches NOW so they're warm by the
-    // time Plivo's stream connects (~1.5s later). Saves ~1.5s off greeting latency.
-    if (callUuid && leadId && campaignId) {
-        prewarmCall(callUuid, leadId, campaignId);
     }
 
     const host = req.headers.host;
