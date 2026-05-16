@@ -1,17 +1,15 @@
 import { supabase } from '../../services/supabase.js';
-import { plivoClient } from '../../services/plivo.js';
 import { firePipelineTrigger, TRIGGER_KEYS } from '../lib/pipelineTriggers.js';
+import { setPostStreamAction } from '../lib/postStreamRoute.js';
 import { logger } from '../lib/logger.js';
 
 export async function handleTransfer(plivoWS, realtimeWS, callSid, leadId, campaignId, args, callLogId) {
-    // Idempotency guard: if a transfer is already in progress for this call, drop the
-    // duplicate invocation immediately. Prevents double-dial when both the model AND
-    // the transcript safety net fire transfer_call.
     if (plivoWS.transferInProgress) {
         logger.info('Transfer already in progress — ignoring duplicate invocation', { callSid });
         return { success: true, note: 'transfer already in progress' };
     }
     plivoWS.transferInProgress = true;
+
     const [{ data: lead }, { data: campaign }] = await Promise.all([
         supabase.from('leads')
             .select('name, phone, interest_level, score, organization_id, assigned_to')
@@ -22,7 +20,10 @@ export async function handleTransfer(plivoWS, realtimeWS, callSid, leadId, campa
             : Promise.resolve({ data: null })
     ]);
 
-    if (!lead) return { success: false, error: 'Lead not found.' };
+    if (!lead) {
+        plivoWS.transferInProgress = false;
+        return { success: false, error: 'Lead not found.' };
+    }
 
     // ── Find best available agent ────────────────────────────────────────────
     let targetPhone = null;
@@ -49,36 +50,35 @@ export async function handleTransfer(plivoWS, realtimeWS, callSid, leadId, campa
             .eq('role', 'employee')
             .not('phone', 'is', null)
             .limit(5);
-
         if (agents?.length) {
-            const chosen = agents[0];
-            targetPhone = chosen.phone;
-            agentName = chosen.full_name;
-            agentUserId = chosen.id;
+            targetPhone = agents[0].phone;
+            agentName = agents[0].full_name;
+            agentUserId = agents[0].id;
         }
     }
 
+    if (!targetPhone) targetPhone = process.env.PLIVO_TRANSFER_NUMBER;
     if (!targetPhone) {
-        targetPhone = process.env.PLIVO_TRANSFER_NUMBER;
-    }
-    if (!targetPhone) {
-        // No agent available — release the guard so a retry can happen
         plivoWS.transferInProgress = false;
         return { success: false, error: 'No available agent phone numbers configured.' };
     }
 
-    // ── Build briefing text spoken to agent before bridging ──────────────────
+    // ── Briefing audio URL — Plivo will fetch this MP3 and play it to the agent
+    //    BEFORE bridging. Generated on demand by /briefing-audio via OpenAI TTS,
+    //    cached server-side for repeat fetches.
     const interestLabel = lead.interest_level
         ? lead.interest_level.charAt(0).toUpperCase() + lead.interest_level.slice(1)
         : null;
-    const spokenContext = [
+    const briefingText = [
         `Incoming transfer from your AI assistant.`,
         `Lead name: ${lead.name || 'Unknown'}.`,
         campaign?.name ? `Campaign: ${campaign.name}.` : null,
         interestLabel ? `Interest level: ${interestLabel}.` : null,
         lead.score != null ? `Lead score: ${lead.score} out of ten.` : null,
         args?.reason ? `Reason for transfer: ${args.reason}.` : null,
+        `Press 1 to accept.`,
     ].filter(Boolean).join(' ');
+    const briefingUrl = `${process.env.WEBSOCKET_SERVER_URL}/briefing-audio?text=${encodeURIComponent(briefingText)}`;
 
     // ── In-app notification (immediate, non-blocking) ────────────────────────
     if (agentUserId) {
@@ -111,58 +111,30 @@ export async function handleTransfer(plivoWS, realtimeWS, callSid, leadId, campa
         firePipelineTrigger(TRIGGER_KEYS.CALL_TRANSFERRED, leadId, lead.organization_id).catch(() => {});
     }
 
-    // ── Schedule the actual call routing after the AI finishes its goodbye ───
-    // Wait for the AI's current response to finish, then put the lead into a
-    // conference room and dial the agent on a separate leg with a briefing prompt.
-    // The 1500ms minimum-wait covers the case where response.done fires before
-    // the audio finishes streaming to Plivo's player buffer.
-    const conferenceRoom = `transfer-${callSid}`;
-    const conferenceXmlUrl = `${process.env.WEBSOCKET_SERVER_URL}/conference-xml?room=${encodeURIComponent(conferenceRoom)}`;
-    const agentAnswerUrl = `${process.env.WEBSOCKET_SERVER_URL}/transfer-agent/answer?` + new URLSearchParams({
-        conference: conferenceRoom,
-        context: spokenContext,
-    });
-
+    // ── Execute transfer after AI's farewell line finishes ───────────────────
+    // The strategy: stash the desired post-stream action in shared state, then close
+    // the AI WebSocket. Plivo's <Stream> element completes when the WS closes (because
+    // keepCallAlive=false), and Plivo follows the <Redirect> to /after-stream, which
+    // reads the stashed action and returns <Dial> XML with the briefing confirmSound.
     const executeTransfer = async () => {
         try {
-            // Detach the AI side BEFORE redirecting the lead. Once the lead is in
-            // the conference, the OpenAI Realtime socket has no useful role — keeping
-            // it open means VAD silence timers and stray transcripts can re-fire tools.
-            try { plivoWS.aiDetached = true; } catch (_) {}
-            try { realtimeWS?.close(); } catch (_) {}
-
-            // 1. Redirect the lead's A-leg to the conference holding room.
-            // Plivo Node SDK passes params as-is; Plivo's REST API expects snake_case.
-            // We send both forms to cover SDK quirks across versions.
-            logger.info('Calling plivo.calls.transfer', { callSid, conferenceXmlUrl });
-            const transferResp = await plivoClient.calls.transfer(callSid, {
-                legs: 'aleg',
-                aleg_url: conferenceXmlUrl,
-                aleg_method: 'GET',
-                alegUrl: conferenceXmlUrl,
-                alegMethod: 'GET',
+            setPostStreamAction(callSid, {
+                type: 'transfer',
+                target: targetPhone,
+                briefingUrl,
             });
-            logger.info('Lead moved to conference', { callSid, conferenceRoom, transferResp: JSON.stringify(transferResp) });
+            logger.info('Post-stream action set, closing AI WebSocket', { callSid, targetPhone });
 
-            // 2. Outbound-dial the agent into the same conference (after briefing)
-            await plivoClient.calls.create(
-                process.env.PLIVO_PHONE_NUMBER,
-                targetPhone,
-                agentAnswerUrl,
-                {
-                    answerMethod: 'GET',
-                    timeLimit: 1800,
-                }
-            );
-            logger.info('Agent leg dialed', { callSid, targetPhone, conferenceRoom });
+            // Detach AI side. This closes our Plivo WS too via the WS handler cleanup,
+            // which ends the <Stream> element and triggers the <Redirect>.
+            plivoWS.aiDetached = true;
+            try { realtimeWS?.close(); } catch (_) {}
+            try { plivoWS.close(); } catch (_) {}
         } catch (err) {
             logger.error('Transfer execution failed', { callSid, error: err.message });
         }
     };
 
-    // Wait for AI to finish speaking before redirecting the call.
-    // The handler sets `pendingAfterResponse` if a response is in-flight; otherwise
-    // we wait a short safety window for any audio in Plivo's player buffer.
     if (plivoWS.scheduleAfterResponse) {
         plivoWS.scheduleAfterResponse(executeTransfer);
     } else {

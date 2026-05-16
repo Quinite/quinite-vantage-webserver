@@ -6,7 +6,8 @@ import answerRouter from './src/routes/answer.js';
 import recordingRouter from './src/routes/recording.js';
 import statusRouter from './src/routes/status.js';
 import hangupRouter from './src/routes/hangup.js';
-import transferAgentRouter from './src/routes/transferAgent.js';
+import briefingAudioRouter from './src/routes/briefingAudio.js';
+import { consumePostStreamAction } from './src/lib/postStreamRoute.js';
 import { startRealtimeWSConnection } from './src/websocket/handler.js';
 import { logger } from './src/lib/logger.js';
 
@@ -26,23 +27,31 @@ app.use('/answer', answerRouter);
 app.use('/recording', recordingRouter);
 app.use('/status', statusRouter);
 app.use('/calls', hangupRouter);
-app.use('/transfer-agent', transferAgentRouter);
+app.use('/briefing-audio', briefingAudioRouter);
 
-// Conference-room XML — used to put the lead's A-leg into a holding conference
-// while we dial the agent on a separate B-leg. The agent joins the same conference
-// after pressing 1 in the briefing prompt.
-app.all('/conference-xml', (req, res) => {
-    const room = req.query.room;
-    const callUuid = req.body?.CallUUID || req.query?.CallUUID;
-    console.log(JSON.stringify({ level: 'info', ts: new Date().toISOString(), msg: 'conference-xml hit (lead leg)', room, callUuid }));
-    if (!room) return res.status(400).send('Missing room');
-    // Lead's leg enters the conference IMMEDIATELY (no pre-speech that would delay entry).
-    // startConferenceOnEnter=false: lead just waits silently until the agent joins.
-    // endConferenceOnExit=true on BOTH legs means whoever hangs up first ends the call.
-    // waitSound: a short looped tone so the lead doesn't think the line is dead.
-    res.set('Content-Type', 'text/xml').send(`<?xml version="1.0" encoding="UTF-8"?>
+// Called by Plivo after the <Stream> element completes (i.e. our WebSocket closed).
+// Consults in-memory state to decide what's next: transfer to agent, or hang up.
+app.all('/after-stream', (req, res) => {
+    const callSid = req.query.callSid || req.body?.callSid;
+    const action = consumePostStreamAction(callSid);
+    res.set('Content-Type', 'text/xml');
+
+    logger.info('after-stream hit', { callSid, hasAction: !!action, action: action?.type });
+
+    if (action?.type === 'transfer' && action.target) {
+        const briefingAttr = action.briefingUrl
+            ? ` confirmSound="${action.briefingUrl.replace(/&/g, '&amp;')}" confirmKey="1"`
+            : '';
+        res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Conference enterSound="beep:1" exitSound="beep:2" waitSound="https://s3.amazonaws.com/plivocloud/Conference.mp3" endConferenceOnExit="false" startConferenceOnEnter="false">${room}</Conference>
+    <Dial timeout="30" hangupOnStar="false" callerId="${process.env.PLIVO_PHONE_NUMBER || ''}"><Number${briefingAttr}>${action.target}</Number></Dial>
+</Response>`);
+        return;
+    }
+
+    res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Hangup/>
 </Response>`);
 });
 
