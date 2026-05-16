@@ -83,6 +83,8 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
         let keepalive = null;
         let responseActive = false; // tracks whether OpenAI has an active response in-flight
         let greetingProtected = true; // do not let user speech cancel the greeting (turn 1)
+        let resolveGreetingDone;
+        const greetingDonePromise = new Promise(r => { resolveGreetingDone = r; });
         let silenceTimeoutMs = 25000; // Default until campaign context loads
         // Debounce cancel: only cancel AI if user speech is sustained (>300ms), not brief
         // backchannel affirmations like "haa", "acha", "hmm" common in Indian conversations.
@@ -198,10 +200,12 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                 };
                 realtimeWS.send(JSON.stringify(fastSessionUpdate));
 
-                // Wait for Plivo's `start` event — audio sent before this is dropped on the floor,
-                // which is what caused leads to hear silence on pickup. The 3s safety timeout in
-                // index.js ensures we don't hang forever if Plivo's start event misfires.
-                await plivoWS.startPromise;
+                // Wait for BOTH:
+                //   (a) OpenAI to acknowledge the session.update — sending response.create before
+                //       session.updated arrives means the model generates with empty/default
+                //       instructions and ignores our greeting text entirely.
+                //   (b) Plivo's `start` event — audio sent before this is dropped on the floor.
+                await Promise.all([sessionReadyPromise, plivoWS.startPromise]);
                 const t0 = Date.now();
                 realtimeWS.send(JSON.stringify({ type: 'response.create' }));
                 logger.info('Greeting dispatched (fast path)', { callSid, msFromConnect: t0 - callStartTime });
@@ -263,9 +267,11 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
 
                 const [allOrgProjects, campaignUnits] = await Promise.all([orgProjectsPromise, campaignUnitsPromise]);
 
-                // Send the full session.update — replaces the minimal greeting prompt for turn 2 onwards.
-                // OpenAI Realtime applies session updates immediately; any in-flight greeting completes
-                // under the original instructions, which is what we want.
+                // Wait until the greeting response has fully completed before swapping in the
+                // full prompt — swapping mid-response can cause the model to abandon the greeting
+                // and improvise a generic reply.
+                await greetingDonePromise;
+
                 const sessionUpdate = createSessionUpdate(context, campaign, campaignProjects, allOrgProjects, campaignUnits);
                 realtimeWS.send(JSON.stringify(sessionUpdate));
                 logger.info('Full session prompt installed', { callSid, msFromConnect: Date.now() - callStartTime, promptBytes: sessionUpdate.session.instructions.length });
@@ -355,6 +361,7 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                         responseActive = false;
                         // Once any AI response (the greeting) finishes, normal interruption rules apply.
                         greetingProtected = false;
+                        resolveGreetingDone();
                         // Start measuring lead silence from the moment the AI finishes speaking.
                         resetSilenceTimer();
                         if (response.response?.usage) {
