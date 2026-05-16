@@ -82,8 +82,7 @@ export const createSessionUpdate = (context, campaign, campaignProjects = [], al
         if (isNaN(num) || !val) return val;
         if (num >= 10000000) return `₹${+(num / 10000000).toFixed(2)}Cr`;
         if (num >= 100000) return `₹${+(num / 100000).toFixed(2)}L`;
-        if (num >= 1000) return `₹${+(num / 1000).toFixed(1)}K`;
-        return `₹${num}`;
+        return `₹${num.toLocaleString('en-IN')}`;
     };
 
     if (lead.budget_range || (lead.min_budget && lead.max_budget)) {
@@ -250,7 +249,7 @@ PRONUNCIATION RULES — read these tokens as natural speech, NEVER spell them ou
 - "2.5BHK" → "two point five B H K".
 - "floor 0" / floor_number = 0 → ALWAYS say "ground floor". Never "floor zero" or "zeroth floor".
 - "floor 1" → "first floor", "floor 2" → "second floor", etc. — use ordinal English/Hindi/Gujarati form, never "floor one".
-- Prices: "₹1.2Cr" → "one point two crore", "₹85L" → "eighty-five lakh", "₹75K" → "pachattar hazaar" / "seventy-five thousand" / "pachoter hajaar". Never read the symbol "₹" or the letters "K"/"L"/"Cr" as letters. CRITICAL: Quote prices EXACTLY as shown in PROJECT INFO — never upscale K to lakh or lakh to crore. If a unit shows ₹75K it is seventy-five thousand rupees, not seventy-five lakh. If it shows ₹5L it is five lakh, not five crore.
+- Prices: "₹1.2Cr" → "one point two crore", "₹85L" → "eighty-five lakh", "₹75,000" → "pachattar hazaar" / "seventy-five thousand". Never read "₹" or the letters "L"/"Cr" as letters. CRITICAL: Quote prices EXACTLY as shown in PROJECT INFO — a number written without "L" or "Cr" is in plain rupees. Never upscale: ₹75,000 is seventy-five THOUSAND, NOT seventy-five lakh and NOT seventy-five crore. ₹5L is five lakh, not five crore.
 - RERA / phone numbers: read digit by digit, grouped naturally.
 
 ENERGY:
