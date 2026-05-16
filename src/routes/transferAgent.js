@@ -37,11 +37,14 @@ router.all('/confirm', (req, res) => {
     res.set('Content-Type', 'text/xml');
 
     if (digits === '1') {
-        // Join the conference room the lead is sitting in
+        // Join the conference room the lead is sitting in. No pre-speech — that would
+        // delay the agent's entry and the lead would keep waiting silently. enterSound
+        // is a short beep so both parties hear when the other joined.
+        // startConferenceOnEnter=true: the moment the agent enters, the conference
+        // "starts" which unmutes the lead (who has been waiting silently).
         res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Speak voice="WOMAN" language="en-US">Connecting now.</Speak>
-    <Conference enterSound="" exitSound="" endConferenceOnExit="true" startConferenceOnEnter="true">${conference}</Conference>
+    <Conference enterSound="beep:1" exitSound="beep:2" endConferenceOnExit="true" startConferenceOnEnter="true">${conference}</Conference>
 </Response>`);
     } else {
         res.send(`<?xml version="1.0" encoding="UTF-8"?>
