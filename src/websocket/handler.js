@@ -179,11 +179,10 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                 const projectLocFast = firstProject?.locality || '';
                 silenceTimeoutMs = (campLite.call_settings?.silence_timeout || 25) * 1000;
 
-                // Pre-written greeting line. We embed the EXACT text in the instructions so
-                // the model doesn't reason about what to say — it just speaks the line verbatim.
+                // Pre-written greeting line. We pass this as the response.create instructions
+                // so the model has ONE job: speak this line. No surrounding "you are X" preamble
+                // because the model otherwise treats the quoted text as context and rephrases.
                 const greetingText = `Hi ${firstName} ji, main Riya bol rahi hoon ${orgNameFast} se — ${projectNameFast ? `${projectNameFast} project${projectLocFast ? ` ${projectLocFast} mein` : ''} ke regarding` : 'ek premium property project ke regarding'} call kar rahi thi.`;
-
-                const greetingInstructions = `You are Riya, a female Indian sales consultant at ${orgNameFast}. The call has just connected. Speak EXACTLY this line, verbatim, in a warm natural female Hinglish voice with feminine grammar — do not add or change a single word, do not greet again, do not explain:\n\n"${greetingText}"\n\nThen stop and wait silently for the lead to respond.`;
 
                 const fastSessionUpdate = {
                     type: 'session.update',
@@ -194,7 +193,7 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                         modalities: ['text', 'audio'],
                         temperature: 0.6,
                         input_audio_transcription: { model: 'whisper-1' },
-                        instructions: greetingInstructions,
+                        instructions: `You are Riya, a female Indian real estate sales consultant. Speak warmly in Hinglish with feminine grammar.`,
                         voice: 'shimmer',
                     }
                 };
@@ -202,12 +201,19 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
 
                 // Wait for BOTH:
                 //   (a) OpenAI to acknowledge the session.update — sending response.create before
-                //       session.updated arrives means the model generates with empty/default
-                //       instructions and ignores our greeting text entirely.
+                //       session.updated arrives means the model generates with default instructions.
                 //   (b) Plivo's `start` event — audio sent before this is dropped on the floor.
                 await Promise.all([sessionReadyPromise, plivoWS.startPromise]);
                 const t0 = Date.now();
-                realtimeWS.send(JSON.stringify({ type: 'response.create' }));
+                // Use per-response instructions to deliver the exact greeting. Per-response
+                // instructions OVERRIDE session instructions for this one response only.
+                realtimeWS.send(JSON.stringify({
+                    type: 'response.create',
+                    response: {
+                        modalities: ['audio', 'text'],
+                        instructions: `Say this exact sentence and nothing else, in a warm natural female Hinglish voice: ${greetingText}`
+                    }
+                }));
                 logger.info('Greeting dispatched (fast path)', { callSid, msFromConnect: t0 - callStartTime });
                 resetSilenceTimer();
 
