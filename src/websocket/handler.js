@@ -82,6 +82,7 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
         let cleanupCalled = false;
         let keepalive = null;
         let responseActive = false; // tracks whether OpenAI has an active response in-flight
+        let greetingProtected = true; // do not let user speech cancel the greeting (turn 1)
         let silenceTimeoutMs = 25000; // Default until campaign context loads
         // Debounce cancel: only cancel AI if user speech is sustained (>300ms), not brief
         // backchannel affirmations like "haa", "acha", "hmm" common in Indian conversations.
@@ -197,9 +198,10 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                 };
                 realtimeWS.send(JSON.stringify(fastSessionUpdate));
 
-                // Don't wait for Plivo's `start` event — OpenAI buffers audio output and Plivo
-                // plays it as soon as the stream is live (typically <200ms after WS connect anyway).
-                // Skipping the await saves ~300-500ms of dead air.
+                // Wait for Plivo's `start` event — audio sent before this is dropped on the floor,
+                // which is what caused leads to hear silence on pickup. The 3s safety timeout in
+                // index.js ensures we don't hang forever if Plivo's start event misfires.
+                await plivoWS.startPromise;
                 const t0 = Date.now();
                 realtimeWS.send(JSON.stringify({ type: 'response.create' }));
                 logger.info('Greeting dispatched (fast path)', { callSid, msFromConnect: t0 - callStartTime });
@@ -351,6 +353,8 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
 
                     case 'response.done':
                         responseActive = false;
+                        // Once any AI response (the greeting) finishes, normal interruption rules apply.
+                        greetingProtected = false;
                         // Start measuring lead silence from the moment the AI finishes speaking.
                         resetSilenceTimer();
                         if (response.response?.usage) {
@@ -369,6 +373,9 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
 
                     case 'input_audio_buffer.speech_started':
                         resetSilenceTimer();
+                        // Never let the lead's first "hello" interrupt the greeting — that caused
+                        // OpenAI to auto-generate a generic English reply before our greeting played.
+                        if (greetingProtected) break;
                         // Debounce: wait 320ms before cancelling the AI response.
                         // Brief Indian backchannels ("haa", "acha", "hmm") are typically
                         // under 300ms and should not interrupt the AI mid-sentence.
