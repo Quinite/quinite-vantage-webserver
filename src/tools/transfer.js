@@ -89,7 +89,7 @@ export async function handleTransfer(plivoWS, realtimeWS, callSid, leadId, campa
         campaign?.name ? `Campaign: ${campaign.name}.` : null,
         interestLabel ? `Interest level: ${interestLabel}.` : null,
         args?.reason ? `Reason for transfer: ${args.reason}.` : null,
-        `Connecting you now.`,
+        `Press 1 to accept and connect with the lead.`,
     ].filter(Boolean).join(' ');
 
     const transferUrl = `${process.env.WEBSOCKET_SERVER_URL}/transfer-xml?` + new URLSearchParams({

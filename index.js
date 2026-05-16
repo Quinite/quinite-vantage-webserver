@@ -32,9 +32,11 @@ app.get('/transfer-xml', (req, res) => {
     res.set('Content-Type', 'text/xml');
 
     if (context) {
-        // Use confirmSoundUrl to whisper context to the agent (B-leg) before bridging
+        // Plivo's confirmSound mechanism: the B-leg (agent) hears the whisper audio,
+        // then must press confirmKey to actually connect to the A-leg (lead). Without
+        // confirmKey, Plivo doesn't gate the bridge and the whisper gets dropped/mixed.
         const whisperUrl = `${process.env.WEBSOCKET_SERVER_URL}/whisper-xml?context=${encodeURIComponent(context)}`;
-        res.send(`<Response><Dial><Number confirmSoundUrl="${whisperUrl.replace(/&/g, '&amp;')}">${target}</Number></Dial></Response>`);
+        res.send(`<Response><Dial><Number confirmSound="${whisperUrl.replace(/&/g, '&amp;')}" confirmKey="1">${target}</Number></Dial></Response>`);
     } else {
         res.send(`<Response><Dial><Number>${target}</Number></Dial></Response>`);
     }
