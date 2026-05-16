@@ -53,6 +53,11 @@ export async function handleTransfer(plivoWS, realtimeWS, callSid, leadId, campa
     if (!targetPhone) targetPhone = process.env.PLIVO_TRANSFER_NUMBER;
     if (!targetPhone) return { success: false, error: 'No available agent phone numbers configured.' };
 
+    // Mark the call as in-transfer so disconnect_call becomes a no-op for the rest
+    // of this session. Prevents the AI's "have a nice day" reflex from hanging up
+    // the lead between transfer_call and the actual conference redirect.
+    plivoWS.transferInProgress = true;
+
     // ── Build briefing text spoken to agent before bridging ──────────────────
     const interestLabel = lead.interest_level
         ? lead.interest_level.charAt(0).toUpperCase() + lead.interest_level.slice(1)
