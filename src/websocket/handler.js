@@ -176,10 +176,11 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                 const projectLocFast = firstProject?.locality || '';
                 silenceTimeoutMs = (campLite.call_settings?.silence_timeout || 25) * 1000;
 
-                // Pre-written greeting line. We feed the EXACT text to OpenAI so the model
-                // doesn't reason about what to say — it just speaks the line verbatim, cutting
-                // first-token latency by ~500-1000ms vs generating from instructions.
+                // Pre-written greeting line. We embed the EXACT text in the instructions so
+                // the model doesn't reason about what to say — it just speaks the line verbatim.
                 const greetingText = `Hi ${firstName} ji, main Riya bol rahi hoon ${orgNameFast} se — ${projectNameFast ? `${projectNameFast} project${projectLocFast ? ` ${projectLocFast} mein` : ''} ke regarding` : 'ek premium property project ke regarding'} call kar rahi thi.`;
+
+                const greetingInstructions = `You are Riya, a female Indian sales consultant at ${orgNameFast}. The call has just connected. Speak EXACTLY this line, verbatim, in a warm natural female Hinglish voice with feminine grammar — do not add or change a single word, do not greet again, do not explain:\n\n"${greetingText}"\n\nThen stop and wait silently for the lead to respond.`;
 
                 const fastSessionUpdate = {
                     type: 'session.update',
@@ -190,30 +191,17 @@ export async function startRealtimeWSConnection(plivoWS, leadId, campaignId, cal
                         modalities: ['text', 'audio'],
                         temperature: 0.6,
                         input_audio_transcription: { model: 'whisper-1' },
-                        instructions: `You are Riya, a female sales consultant at ${orgNameFast}. Speak the assistant message verbatim in a warm, natural Hinglish female voice. Then stop and wait.`,
+                        instructions: greetingInstructions,
                         voice: 'shimmer',
                     }
                 };
                 realtimeWS.send(JSON.stringify(fastSessionUpdate));
 
-                // Inject the greeting as a pre-formed assistant turn — OpenAI speaks it as-is.
-                realtimeWS.send(JSON.stringify({
-                    type: 'conversation.item.create',
-                    item: {
-                        type: 'message',
-                        role: 'assistant',
-                        content: [{ type: 'text', text: greetingText }]
-                    }
-                }));
-
                 // Don't wait for Plivo's `start` event — OpenAI buffers audio output and Plivo
                 // plays it as soon as the stream is live (typically <200ms after WS connect anyway).
                 // Skipping the await saves ~300-500ms of dead air.
                 const t0 = Date.now();
-                realtimeWS.send(JSON.stringify({
-                    type: 'response.create',
-                    response: { modalities: ['audio'], instructions: `Speak the previous assistant message verbatim in a warm female Hinglish voice. Do not add anything.` }
-                }));
+                realtimeWS.send(JSON.stringify({ type: 'response.create' }));
                 logger.info('Greeting dispatched (fast path)', { callSid, msFromConnect: t0 - callStartTime });
                 resetSilenceTimer();
 
