@@ -250,7 +250,7 @@ PRONUNCIATION RULES — read these tokens as natural speech, NEVER spell them ou
 - "2.5BHK" → "two point five B H K".
 - "floor 0" / floor_number = 0 → ALWAYS say "ground floor". Never "floor zero" or "zeroth floor".
 - "floor 1" → "first floor", "floor 2" → "second floor", etc. — use ordinal English/Hindi/Gujarati form, never "floor one".
-- Prices: "₹1.2Cr" → "one point two crore", "₹85L" → "eighty-five lakh". Never read the symbol "₹" or the letter "L"/"Cr" as letters.
+- Prices: "₹1.2Cr" → "one point two crore", "₹85L" → "eighty-five lakh", "₹75K" → "pachattar hazaar" / "seventy-five thousand" / "pachoter hajaar". Never read the symbol "₹" or the letters "K"/"L"/"Cr" as letters. CRITICAL: Quote prices EXACTLY as shown in PROJECT INFO — never upscale K to lakh or lakh to crore. If a unit shows ₹75K it is seventy-five thousand rupees, not seventy-five lakh. If it shows ₹5L it is five lakh, not five crore.
 - RERA / phone numbers: read digit by digit, grouped naturally.
 
 ENERGY:
