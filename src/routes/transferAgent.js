@@ -14,14 +14,15 @@ router.all('/answer', (req, res) => {
 
     logger.info('transfer-agent/answer', { conference, contextLen: context.length });
 
+    // GetDigits captures key presses throughout the entire nested Speak — the agent can
+    // press 1 as soon as they have enough context, doesn't have to wait for the prompt to finish.
+    // On timeout, redirect=true sends to the confirm URL with empty Digits, which we handle.
     res.set('Content-Type', 'text/xml').send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Speak voice="Polly.Aditi" language="en-IN">${safeContext}</Speak>
-    <GetDigits action="${confirmUrl.replace(/&/g, '&amp;')}" method="POST" timeout="15" numDigits="1" retries="2" redirect="true" finishOnKey="">
-        <Speak voice="Polly.Aditi" language="en-IN">Press 1 to accept and connect with the lead. Press any other key to decline.</Speak>
+    <GetDigits action="${confirmUrl.replace(/&/g, '&amp;')}" method="POST" timeout="20" numDigits="1" retries="1" redirect="true" finishOnKey="">
+        <Speak voice="WOMAN" language="en-US">${safeContext} Press 1 to accept and connect with the lead. Press 2 to decline.</Speak>
     </GetDigits>
-    <Speak voice="Polly.Aditi" language="en-IN">No input received. Goodbye.</Speak>
-    <Hangup/>
+    <Redirect>${confirmUrl.replace(/&/g, '&amp;')}</Redirect>
 </Response>`);
 });
 
@@ -39,13 +40,13 @@ router.all('/confirm', (req, res) => {
         // Join the conference room the lead is sitting in
         res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Speak voice="Polly.Aditi" language="en-IN">Connecting now.</Speak>
+    <Speak voice="WOMAN" language="en-US">Connecting now.</Speak>
     <Conference enterSound="" exitSound="" endConferenceOnExit="true" startConferenceOnEnter="true">${conference}</Conference>
 </Response>`);
     } else {
         res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Speak voice="Polly.Aditi" language="en-IN">Transfer declined. Goodbye.</Speak>
+    <Speak voice="WOMAN" language="en-US">Transfer declined. Goodbye.</Speak>
     <Hangup/>
 </Response>`);
     }

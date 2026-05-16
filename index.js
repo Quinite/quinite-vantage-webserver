@@ -36,7 +36,7 @@ app.all('/conference-xml', (req, res) => {
     if (!room) return res.status(400).send('Missing room');
     res.set('Content-Type', 'text/xml').send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Speak voice="Polly.Aditi" language="en-IN">Please hold while I connect you.</Speak>
+    <Speak voice="WOMAN" language="en-US">Please hold while I connect you.</Speak>
     <Conference enterSound="" exitSound="" waitSound="" endConferenceOnExit="false" startConferenceOnEnter="false">${room}</Conference>
 </Response>`);
 });
