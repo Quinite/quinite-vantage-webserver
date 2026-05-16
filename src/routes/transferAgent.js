@@ -44,7 +44,7 @@ router.all('/confirm', (req, res) => {
         // "starts" which unmutes the lead (who has been waiting silently).
         res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Conference enterSound="beep:1" exitSound="beep:2" endConferenceOnExit="true" startConferenceOnEnter="true">${conference}</Conference>
+    <Conference enterSound="beep:1" exitSound="beep:2" endConferenceOnExit="true" startConferenceOnEnter="true" hangupOnStar="true">${conference}</Conference>
 </Response>`);
     } else {
         res.send(`<?xml version="1.0" encoding="UTF-8"?>

@@ -33,6 +33,8 @@ app.use('/transfer-agent', transferAgentRouter);
 // after pressing 1 in the briefing prompt.
 app.all('/conference-xml', (req, res) => {
     const room = req.query.room;
+    const callUuid = req.body?.CallUUID || req.query?.CallUUID;
+    console.log(JSON.stringify({ level: 'info', ts: new Date().toISOString(), msg: 'conference-xml hit (lead leg)', room, callUuid }));
     if (!room) return res.status(400).send('Missing room');
     // Lead's leg enters the conference IMMEDIATELY (no pre-speech that would delay entry).
     // startConferenceOnEnter=false: lead just waits silently until the agent joins.
@@ -40,7 +42,7 @@ app.all('/conference-xml', (req, res) => {
     // waitSound: a short looped tone so the lead doesn't think the line is dead.
     res.set('Content-Type', 'text/xml').send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Conference enterSound="beep:1" exitSound="beep:2" waitSound="https://s3.amazonaws.com/plivocloud/Trumpet.mp3" endConferenceOnExit="true" startConferenceOnEnter="false">${room}</Conference>
+    <Conference enterSound="beep:1" exitSound="beep:2" waitSound="https://s3.amazonaws.com/plivocloud/Conference.mp3" endConferenceOnExit="false" startConferenceOnEnter="false">${room}</Conference>
 </Response>`);
 });
 

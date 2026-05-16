@@ -132,12 +132,16 @@ export async function handleTransfer(plivoWS, realtimeWS, callSid, leadId, campa
             try { realtimeWS?.close(); } catch (_) {}
 
             // 1. Redirect the lead's A-leg to the conference holding room
-            await plivoClient.calls.transfer(callSid, {
+            // NOTE: Plivo Node SDK requires camelCase params (alegUrl, alegMethod).
+            // Snake-case (aleg_url) is silently accepted by the SDK but ignored by the
+            // Plivo API — the call returns "success" but no redirect actually happens.
+            logger.info('Calling plivo.calls.transfer', { callSid, conferenceXmlUrl });
+            const transferResp = await plivoClient.calls.transfer(callSid, {
                 legs: 'aleg',
-                aleg_url: conferenceXmlUrl,
-                aleg_method: 'GET',
+                alegUrl: conferenceXmlUrl,
+                alegMethod: 'GET',
             });
-            logger.info('Lead moved to conference', { callSid, conferenceRoom });
+            logger.info('Lead moved to conference', { callSid, conferenceRoom, transferResp: JSON.stringify(transferResp) });
 
             // 2. Outbound-dial the agent into the same conference (after briefing)
             await plivoClient.calls.create(
